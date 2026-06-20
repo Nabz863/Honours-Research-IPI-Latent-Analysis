@@ -79,12 +79,28 @@ def _resolve_target_layers(model: nn.Module, target_layers: Optional[Sequence[in
 
 
 def _get_layer_list(model: nn.Module):
-    """Return the nn.ModuleList of transformer layers, or None if not found."""
+    """
+    Return the nn.ModuleList of transformer layers, or None if not found.
+
+    Strategy
+    --------
+    1. Fast path: try known attribute paths for common architectures.
+       Checked first because they're unambiguous when correct.
+    2. Auto-discovery fallback: walk the full module tree and collect every
+       nn.ModuleList. Score each by (a) length — transformer stacks are
+       typically >= 4 layers, and (b) homogeneity — every element should be
+       the same type, since a real transformer stack is N copies of one
+       block class. Return the longest homogeneous ModuleList found.
+       This means new/unseen VLM architectures are supported automatically,
+       without requiring a hardcoded path for every model family.
+    """
     candidates = [
-        # LLaVA-NeXT / InternVL
-        lambda m: m.language_model.model.layers,
-        # Qwen2-VL
+        # Qwen2-VL / generic
         lambda m: m.model.layers,
+        # LLaVA-NeXT (language_model is itself the LM, not wrapped in .model)
+        lambda m: m.language_model.layers,
+        # Some LLaVA / InternVL variants wrap one level deeper
+        lambda m: m.language_model.model.layers,
         # Bare LlamaModel
         lambda m: m.model.model.layers,
         # Direct
@@ -97,7 +113,39 @@ def _get_layer_list(model: nn.Module):
                 return layers
         except AttributeError:
             continue
-    return None
+
+    return _discover_layer_list(model)
+
+
+def _discover_layer_list(model: nn.Module, min_layers: int = 4):
+    """
+    Fallback auto-discovery: find the best-looking transformer stack
+    anywhere in the module tree.
+
+    Returns the longest nn.ModuleList whose elements are all the same
+    type (homogeneous), with at least `min_layers` elements. Returns
+    None if nothing qualifies.
+    """
+    best = None
+    best_len = 0
+
+    for _, module in model.named_modules():
+        if not isinstance(module, nn.ModuleList):
+            continue
+        if len(module) < min_layers:
+            continue
+
+        # Homogeneity check: every block should be the same class,
+        # as in a real transformer stack (N copies of one decoder layer).
+        types = {type(sub) for sub in module}
+        if len(types) != 1:
+            continue
+
+        if len(module) > best_len:
+            best = module
+            best_len = len(module)
+
+    return best
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,39 @@ def _make_input(batch=1, seq=5, dim=16):
     return torch.randn(batch, seq, dim)
 
 
+class _FakeVLM_UnconventionalPath(nn.Module):
+    """
+    VLM stub whose layers live somewhere NOT covered by the hardcoded
+    candidate paths (mimics discovering a brand-new architecture).
+    Tests that _discover_layer_list() finds it anyway.
+    """
+    def __init__(self, n_layers: int = 6, dim: int = 16):
+        super().__init__()
+
+        class _Backbone(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.decoder_blocks = nn.ModuleList(
+                    [_FakeTransformerLayer(dim) for _ in range(n_layers)]
+                )
+
+        class _Wrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_backbone = _Backbone()
+
+        self.core = _Wrapper()
+        # Also add a smaller, irrelevant ModuleList (e.g. a vision tower)
+        # to confirm discovery picks the LONGEST homogeneous list, not
+        # just the first one found.
+        self.vision_stub = nn.ModuleList([_FakeTransformerLayer(dim) for _ in range(2)])
+
+    def forward(self, x):
+        for layer in self.core.text_backbone.decoder_blocks:
+            x = layer(x)[0]
+        return x
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -79,6 +112,30 @@ def test_layer_discovery():
     layers = _get_layer_list(model)
     assert layers is not None, "Layer list not found"
     assert len(layers) == 4
+
+
+def test_auto_discovery_unconventional_path():
+    """
+    _get_layer_list should fall back to auto-discovery and still find
+    the transformer stack even when it's at a path none of the
+    hardcoded candidates check (core.text_backbone.decoder_blocks).
+    """
+    model = _FakeVLM_UnconventionalPath(n_layers=6)
+    layers = _get_layer_list(model)
+    assert layers is not None, "Auto-discovery failed to find layer list"
+    assert len(layers) == 6, f"Expected 6 layers, found {len(layers)}"
+
+
+def test_auto_discovery_picks_longest_homogeneous_list():
+    """
+    When multiple ModuleLists exist (e.g. a small vision tower stub
+    alongside the real decoder stack), auto-discovery should pick the
+    longest homogeneous one — i.e. the actual transformer stack, not
+    an incidental shorter list.
+    """
+    model = _FakeVLM_UnconventionalPath(n_layers=6)
+    layers = _get_layer_list(model)
+    assert len(layers) == 6, "Did not select the longer of the two ModuleLists"
 
 
 def test_explicit_target_layers():
@@ -238,6 +295,8 @@ def test_cpu_tensors():
 if __name__ == "__main__":
     tests = [
         test_layer_discovery,
+        test_auto_discovery_unconventional_path,
+        test_auto_discovery_picks_longest_homogeneous_list,
         test_explicit_target_layers,
         test_heuristic_target_layers,
         test_activation_shape_last,
