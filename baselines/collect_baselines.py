@@ -149,10 +149,14 @@ def collect_baselines(
         t0 = time.perf_counter()
 
         # ---- Build input ------------------------------------------------
-        if dry_run or modality == "text":
-            inputs = make_synthetic_text_input(processor)
+        if dry_run:
+            # Fake input tensor — no processor needed
+            inputs = {"inputs_embeds": torch.randn(1, 5, model.dim)}
         else:
-            inputs = make_synthetic_multimodal_input(processor)
+            if modality == "text":
+                inputs = make_synthetic_text_input(processor)
+            else:
+                inputs = make_synthetic_multimodal_input(processor)
 
         # Move to device
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
