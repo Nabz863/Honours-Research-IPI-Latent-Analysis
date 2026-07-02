@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ipi_baseline
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --partition=biggpu
+#SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00
@@ -10,15 +10,19 @@
 
 # ============================================================
 # Phase 1: Clean-condition baseline collection
-# Wits HPC (SLURM) job script
+# Wits HPC (SLURM) job script — mscluster biggpu partition
+#
+# Hardware: Quadro RTX 8000 (49GB VRAM), CUDA 13.2
+# Note: --gres=gpu:1 omitted intentionally — GRES not yet
+# configured on the post-attack rebuild (July 2026). GPUs
+# are physically present and visible to PyTorch via CUDA.
+# Re-add --gres=gpu:1 once MSS confirms GRES registration.
 #
 # Submit with:
 #   sbatch hpc_baseline.sh
 #
 # To collect text-only baselines, change --modality to text.
-# To use the 13B model, change --model to llava13b and add
-# --quantise if VRAM < 40GB (sets load_in_4bit=True — flag
-# results as potentially precision-affected).
+# To use the 13B model, change --model to llava13b.
 # ============================================================
 
 set -euo pipefail
@@ -26,21 +30,19 @@ set -euo pipefail
 mkdir -p logs
 
 # ---- Environment -----------------------------------------------
-module load python/3.12 cuda/12.1 2>/dev/null || true
+source ~/Honours-Research-IPI-Latent-Analysis/venv/bin/activate
 
-# Activate your virtualenv / conda env if needed:
-# source ~/envs/ipi/bin/activate
-
-# ---- HuggingFace cache (use scratch to avoid home quota) -------
-export HF_HOME=/scratch/$USER/hf_cache
+# ---- HuggingFace cache (keep off home directory quota) ---------
+export HF_HOME=/home-mscluster/$USER/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
 mkdir -p "$HF_HOME"
 
 echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
+echo "Python: $(python --version)"
 
 # ---- Run -------------------------------------------------------
-cd "$SLURM_SUBMIT_DIR"
+cd ~/Honours-Research-IPI-Latent-Analysis
 
 python baselines/collect_baselines.py \
     --model      llava7b \
