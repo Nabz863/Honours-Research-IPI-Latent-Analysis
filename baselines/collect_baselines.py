@@ -263,7 +263,13 @@ def main():
     # Load model
     logger.info("Loading model: %s (hpc=%s)", args.model, args.hpc)
     loader_fn = MODEL_REGISTRY[args.model]
-    model, processor = loader_fn(hpc=args.hpc)
+    if args.dry_run:
+        logger.info("Dry run: skipping real model load, using fake model.")
+        from tests.test_hooks import _FakeVLM
+        model = _FakeVLM(n_layers=32, dim=4096)
+        processor = None
+    else:
+        model, processor = loader_fn(hpc=args.hpc)
 
     # Output directory
     out = Path(args.output_dir) if args.output_dir else Path("baselines") / args.model
