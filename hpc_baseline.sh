@@ -1,48 +1,44 @@
 #!/bin/bash
 #SBATCH --job-name=ipi_baseline
-#SBATCH --partition=biggpu
+#SBATCH --partition=bigbatch
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00
-#SBATCH --output=logs/baseline_%j.out
-#SBATCH --error=logs/baseline_%j.err
+#SBATCH --output=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs/baseline_%j.out
+#SBATCH --error=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs/baseline_%j.err
 
 # ============================================================
 # Phase 1: Clean-condition baseline collection
-# Wits HPC (SLURM) job script — mscluster biggpu partition
+# Wits HPC (SLURM) job script — mscluster bigbatch partition
 #
-# Hardware: Quadro RTX 8000 (49GB VRAM), CUDA 13.2
-# Note: --gres=gpu:1 omitted intentionally — GRES not yet
-# configured on the post-attack rebuild (July 2026). GPUs
-# are physically present and visible to PyTorch via CUDA.
-# Re-add --gres=gpu:1 once MSS confirms GRES registration.
-#
-# Submit with:
-#   sbatch hpc_baseline.sh
-#
-# To collect text-only baselines, change --modality to text.
-# To use the 13B model, change --model to llava13b.
+# Hardware: Quadro RTX 8000 (49GB VRAM), CUDA 13.3
+# Submit with: sbatch hpc_baseline.sh
 # ============================================================
 
 set -euo pipefail
 
-mkdir -p logs
+mkdir -p /home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs
+
+# ---- System CUDA -----------------------------------------------
+export CUDA_HOME=/usr/local/cuda-13.3
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 # ---- Environment -----------------------------------------------
-source ~/Honours-Research-IPI-Latent-Analysis/venv/bin/activate
+source /home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/venv/bin/activate
 
-# ---- HuggingFace cache (keep off home directory quota) ---------
-export HF_HOME=/home-mscluster/$USER/hf_cache
+# ---- HuggingFace cache (weights in /datasets, not home dir) ----
+export HF_HOME=/datasets/nmahomed/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
-mkdir -p "$HF_HOME"
 
 echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "Python: $(python --version)"
+echo "CUDA: $(python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.device_count())')"
 
 # ---- Run -------------------------------------------------------
-cd ~/Honours-Research-IPI-Latent-Analysis
+cd /home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis
 
 python baselines/collect_baselines.py \
     --model      llava7b \
