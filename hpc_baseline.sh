@@ -23,7 +23,7 @@ mkdir -p /home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs
 # ---- System CUDA -----------------------------------------------
 export CUDA_HOME=/usr/local/cuda-13.3
 export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
 
 # ---- Environment -----------------------------------------------
 source /home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/venv/bin/activate
