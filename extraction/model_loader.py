@@ -238,7 +238,7 @@ def load_internvl_8b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
     cfg = LoadConfig(
         model_id="OpenGVLab/InternVL2-8B",
         dtype=torch.bfloat16,
-        device_map="auto" if hpc else "cpu",
+        device_map=None,
         attn_implementation="eager",
     )
     return VLMLoader(cfg).load()
