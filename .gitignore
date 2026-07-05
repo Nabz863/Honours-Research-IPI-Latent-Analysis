@@ -1,0 +1,6 @@
+venv/
+baselines/*/activations/
+logs/
+__pycache__/
+*.pyc
+hf_cache/
