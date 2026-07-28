@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 from transformers import (
+    AutoModelForImageTextToText,
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -186,17 +187,20 @@ class VLMLoader:
 
     def _load_internvl(self):
         """
-        InternVL uses AutoModelForCausalLM with trust_remote_code.
+        As of transformers 5.x, InternVL has native (non-remote-code) support
+        via InternVLForConditionalGeneration / AutoModelForImageTextToText,
+        for "-hf" suffixed checkpoints (e.g. OpenGVLab/InternVL3-8B-hf).
+        This sidesteps the all_tied_weights_keys incompatibility that the
+        original OpenGVLab/InternVL2-8B (trust_remote_code=True) checkpoint
+        hits under transformers v5.x -- see SCOPING_DECISIONS.md Decision 3.
+        No trust_remote_code needed; standard Auto* classes work directly.
         """
         kwargs = self._base_kwargs()
-        kwargs["trust_remote_code"] = True
-        model = AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForImageTextToText.from_pretrained(
             self.config.model_id, **kwargs
         )
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_id, trust_remote_code=True
-        )
-        return model, tokenizer
+        processor = AutoProcessor.from_pretrained(self.config.model_id)
+        return model, processor
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +239,14 @@ def load_qwen2vl_7b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
 
 
 def load_internvl_8b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
+    """
+    InternVL3-8B-hf (native transformers support) -- see SCOPING_DECISIONS.md
+    Decision 3 for why this replaces the original InternVL2-8B target.
+    """
     cfg = LoadConfig(
-        model_id="OpenGVLab/InternVL2-8B",
+        model_id="OpenGVLab/InternVL3-8B-hf",
         dtype=torch.bfloat16,
-        device_map=None,
+        device_map="auto" if hpc else "cpu",
         attn_implementation="eager",
     )
     return VLMLoader(cfg).load()

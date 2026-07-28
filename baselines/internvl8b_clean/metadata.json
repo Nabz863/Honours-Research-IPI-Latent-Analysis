@@ -1,0 +1,25 @@
+{
+  "model_id": "OpenGVLab/InternVL3-8B-hf",
+  "n_samples": 100,
+  "n_saved": 100,
+  "target_layers": [
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24
+  ],
+  "n_layers_total": 28,
+  "token_aggregation": "last",
+  "modality": "multimodal",
+  "dtype": "torch.bfloat16",
+  "device": "cpu",
+  "dry_run": false,
+  "avg_forward_pass_s": 15.137863772921264
+}

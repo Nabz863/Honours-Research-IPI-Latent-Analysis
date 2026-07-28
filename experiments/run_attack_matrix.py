@@ -102,8 +102,16 @@ def run_agent_episode(model, processor, adversarial_task: Dict[str, Any]) -> Dic
 
 
 def _dry_run_episode(model, processor, adversarial_task: Dict[str, Any]) -> Dict[str, Any]:
-    """Stand-in: a single forward pass only -- no real ASR/UA measurement."""
+    """
+    Stand-in: a single forward pass only -- no real ASR/UA measurement.
+
+    Moves inputs onto the model's device before the forward pass (same
+    pattern as collect_baselines.py) -- required once this runs against
+    a real GPU-loaded model rather than the CPU-only smoke test model.
+    """
     inputs = processor(text=adversarial_task["adversarial_text"], return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
     with torch.no_grad():
         _ = model(**inputs)
     return {"asr_success": None, "utility_success": None}
