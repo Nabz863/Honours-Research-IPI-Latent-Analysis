@@ -133,6 +133,9 @@ def run_agentdojo_episode(
     task: AgentDojoTask,
     context: Dict[str, Any],
     injections: Optional[Dict[str, str]] = None,
+    defense: Optional[Any] = None,
+    icon: Optional[Any] = None,
+    icon_record_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Runs ONE real AgentDojo episode -- the real episode_fn, replacing
@@ -144,11 +147,22 @@ def run_agentdojo_episode(
         condition. Which vector id(s) a given suite/task actually uses
         is suite-specific -- inspect suite.get_injection_vector_defaults()
         for the real key names before calling this with real payloads.
+    defense : optional defenses.base.BaseDefense, passed straight through
+        to LocalVLMPipelineElement -- see that class's docstring for how
+        tool-message content gets defended and why a fresh
+        LocalVLMPipelineElement (and therefore a fresh defense cache) is
+        constructed per episode call here, not reused across tasks.
 
-    Returns {"asr_success", "utility_success", "turn_activations"} --
-    turn_activations is the full per-turn sequence from
-    LocalVLMPipelineElement (see environments/agentdojo_llm.py), so the
-    caller decides which turn(s) to actually persist.
+    Returns {"asr_success", "utility_success", "turn_activations",
+    "turn_tool_calls", "turn_raw_completions"} -- turn_activations is the
+    full per-turn sequence from LocalVLMPipelineElement (see
+    environments/agentdojo_llm.py), so the caller decides which turn(s)
+    to actually persist. turn_tool_calls / turn_raw_completions were
+    added to answer a real question found analyzing a live run (zero ASR
+    correlating with the model never exceeding 2 turns across 5580
+    episodes) -- see agentdojo_llm.py's constructor docstring for why
+    activations alone couldn't distinguish "not engaging with tools" from
+    "never saw the injected content in the first place."
     """
     suite = context["suites"][task.suite_name]
     injection_task = (
@@ -156,7 +170,8 @@ def run_agentdojo_episode(
     )
     user_task = suite.get_user_task_by_id(task.user_task_id)
 
-    llm = LocalVLMPipelineElement(model, processor, extractor)
+    llm = LocalVLMPipelineElement(model, processor, extractor, defense=defense,
+                                  icon=icon, icon_record_only=icon_record_only)
     tools_loop = ToolsExecutionLoop([ToolsExecutor(tool_result_to_str), llm])
     pipeline = AgentPipeline([SystemMessage(DEFAULT_SYSTEM_MESSAGE), InitQuery(), llm, tools_loop])
 
@@ -167,6 +182,7 @@ def run_agentdojo_episode(
         injections=injections or {},
     )
 
+
     # security is only meaningful when an injection_task was actually run --
     # run_task_with_pipeline returns (utility, True) as a placeholder when
     # injection_task is None, which is NOT a real ASR value.
@@ -176,4 +192,11 @@ def run_agentdojo_episode(
         "asr_success": asr_success,
         "utility_success": utility,
         "turn_activations": llm.turn_activations,
+        "turn_tool_calls": llm.turn_tool_calls,
+        "turn_raw_completions": llm.turn_raw_completions,
+        # ICON records per-turn detection metadata (flagged/confidence/
+        # FIS per layer) and, in calibration mode, the raw feature
+        # vectors. Empty lists when ICON is not in use.
+        "turn_icon_info": llm.turn_icon_info,
+        "turn_icon_features": llm.turn_icon_features,
     }

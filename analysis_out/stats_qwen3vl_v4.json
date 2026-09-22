@@ -1,0 +1,172 @@
+{
+  "config": {
+    "results_dir": "agentdojo_matrix_v4_qwen3vl",
+    "layer": 31,
+    "n_perm": 50,
+    "out": "analysis_out/stats_qwen3vl_v4.json"
+  },
+  "reachability": {
+    "gcg": {
+      "n": 623,
+      "n_nonzero": 497,
+      "rate": 0.797752808988764,
+      "rate_ci95": [
+        0.764430056747931,
+        0.8274260038581296
+      ],
+      "delta_mean_all": 88.82511901855469,
+      "delta_mean_nonzero": 111.34417724609375,
+      "delta_median_nonzero": 105.02980041503906,
+      "delta_max": 262.0810852050781
+    },
+    "obfuscated_activation": {
+      "n": 623,
+      "n_nonzero": 497,
+      "rate": 0.797752808988764,
+      "rate_ci95": [
+        0.764430056747931,
+        0.8274260038581296
+      ],
+      "delta_mean_all": 88.4273452758789,
+      "delta_mean_nonzero": 110.84555053710938,
+      "delta_median_nonzero": 105.02980041503906,
+      "delta_max": 262.0810852050781
+    },
+    "template_ipi": {
+      "n": 617,
+      "n_nonzero": 257,
+      "rate": 0.4165316045380875,
+      "rate_ci95": [
+        0.378265492595618,
+        0.4558306762178121
+      ],
+      "delta_mean_all": 49.251182556152344,
+      "delta_mean_nonzero": 118.24117279052734,
+      "delta_median_nonzero": 116.6311264038086,
+      "delta_max": 258.69781494140625
+    }
+  },
+  "attack_comparison": [
+    {
+      "attack_a": "gcg",
+      "attack_b": "obfuscated_activation",
+      "n_pairs": 497,
+      "median_a": 105.02980041503906,
+      "median_b": 105.02980041503906,
+      "rank_biserial_r": 0.019230769230769232,
+      "wilcoxon_W": 2543.0,
+      "p_raw": 0.5442458568396122,
+      "p_holm": 0.5442458568396122
+    },
+    {
+      "attack_a": "gcg",
+      "attack_b": "template_ipi",
+      "n_pairs": 491,
+      "median_a": 104.47483825683594,
+      "median_b": 12.289581298828125,
+      "rank_biserial_r": 0.7637474541751528,
+      "wilcoxon_W": 8131.0,
+      "p_raw": 5.429256780523692e-62,
+      "p_holm": 1.628777034157108e-61
+    },
+    {
+      "attack_a": "obfuscated_activation",
+      "attack_b": "template_ipi",
+      "n_pairs": 491,
+      "median_a": 104.20682525634766,
+      "median_b": 12.289581298828125,
+      "rank_biserial_r": 0.7556008146639511,
+      "wilcoxon_W": 8277.0,
+      "p_raw": 1.175997324230304e-61,
+      "p_holm": 2.351994648460608e-61
+    }
+  ],
+  "probe": {
+    "gcg": {
+      "n_samples": 994,
+      "n_pairs": 497,
+      "accuracy": 0.8017632773730335,
+      "null_mean": 0.498438505261676,
+      "null_p95": 0.5170543633196073,
+      "p_perm": 0.0196078431372549,
+      "n_perm": 50,
+      "p_holm": 0.058823529411764705
+    },
+    "obfuscated_activation": {
+      "n_samples": 994,
+      "n_pairs": 497,
+      "accuracy": 0.8097169429486503,
+      "null_mean": 0.5024321437370218,
+      "null_p95": 0.5165139196846513,
+      "p_perm": 0.0196078431372549,
+      "n_perm": 50,
+      "p_holm": 0.058823529411764705
+    },
+    "template_ipi": {
+      "n_samples": 514,
+      "n_pairs": 257,
+      "accuracy": 0.8873563218390803,
+      "null_mean": 0.5014956051386072,
+      "null_p95": 0.5165551048005409,
+      "p_perm": 0.0196078431372549,
+      "n_perm": 50,
+      "p_holm": 0.058823529411764705
+    }
+  },
+  "reach_vs_asr": [
+    {
+      "attack": "gcg",
+      "table": [
+        [
+          3,
+          494
+        ],
+        [
+          0,
+          126
+        ]
+      ],
+      "asr_given_nonzero": 0.006036217303822937,
+      "asr_given_zero": 0.0,
+      "odds_ratio": null,
+      "p_raw": 1.0,
+      "p_holm": 1.0
+    },
+    {
+      "attack": "obfuscated_activation",
+      "table": [
+        [
+          3,
+          494
+        ],
+        [
+          0,
+          126
+        ]
+      ],
+      "asr_given_nonzero": 0.006036217303822937,
+      "asr_given_zero": 0.0,
+      "odds_ratio": null,
+      "p_raw": 1.0,
+      "p_holm": 1.0
+    },
+    {
+      "attack": "template_ipi",
+      "table": [
+        [
+          7,
+          250
+        ],
+        [
+          0,
+          360
+        ]
+      ],
+      "asr_given_nonzero": 0.027237354085603113,
+      "asr_given_zero": 0.0,
+      "odds_ratio": null,
+      "p_raw": 0.002072904522800314,
+      "p_holm": 0.006218713568400942
+    }
+  ]
+}

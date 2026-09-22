@@ -9,6 +9,20 @@ Supported models
   - LLaVA-NeXT  (7B / 13B)   [primary]
   - Qwen2-VL    (7B)          [co-primary]
   - InternVL2   (8B)          [cross-architecture validation]
+  - Qwen3-VL    (8B)          [4th model -- added specifically to test
+    whether sustained, multi-step agentic engagement (or the lack of it)
+    is a LLaVA-NeXT-specific limitation or a broader one. Real AgentDojo
+    data showed the model never exceeding 2 turns across 5580 episodes,
+    correlating with near-zero ASR; Qwen3-VL-8B's own model card
+    explicitly advertises multi-step tool-invoking agent behavior as a
+    design focus, unlike the three existing targets, none of which were
+    chosen for that property specifically. Verified importable against
+    a real transformers install (transformers==5.14.1,
+    Qwen3VLForConditionalGeneration) -- NOT verified against the real
+    downloaded weights, which needs huggingface.co access this
+    environment doesn't have; that verification needs to happen on the
+    cluster, which already has it (Phase 1 baselines for the other three
+    models were downloaded there).]
 
 HPC notes
 ---------
@@ -34,6 +48,7 @@ from transformers import (
     LlavaNextForConditionalGeneration,
     LlavaNextProcessor,
     Qwen2VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
     AutoModelForCausalLM,
 )
 
@@ -91,6 +106,7 @@ class VLMLoader:
         "llava": "_load_llava",
         "qwen2_vl": "_load_qwen2vl",
         "internvl": "_load_internvl",
+        "qwen3_vl": "_load_qwen3vl",
     }
 
     def __init__(self, config: LoadConfig):
@@ -112,12 +128,24 @@ class VLMLoader:
         if "llava" in mid:
             self.arch = "llava"
             self.model, self.processor = self._load_llava()
+        elif "qwen3" in mid and "vl" in mid:
+            # Checked BEFORE the qwen2 branch deliberately -- "qwen2" is
+            # not a substring of "qwen3", so order wouldn't actually
+            # matter here, but keeping newer-first reads correctly if a
+            # qwen4/qwen3.5 naming pattern ever gets added later.
+            self.arch = "qwen3_vl"
+            self.model, self.processor = self._load_qwen3vl()
         elif "qwen2" in mid and "vl" in mid:
             self.arch = "qwen2_vl"
             self.model, self.processor = self._load_qwen2vl()
         elif "internvl" in mid:
             self.arch = "internvl"
             self.model, self.processor = self._load_internvl()
+        elif "gemma" in mid:
+            # Gemma 4 reports model_type 'gemma4_unified' (12B/31B) or
+            # 'gemma4' (E2B/E4B); both load through the same path here.
+            self.arch = "gemma4"
+            self.model, self.processor = self._load_gemma4()
         else:
             raise ValueError(
                 f"Cannot infer architecture from model_id='{self.config.model_id}'. "
@@ -202,6 +230,69 @@ class VLMLoader:
         processor = AutoProcessor.from_pretrained(self.config.model_id)
         return model, processor
 
+    def _load_qwen3vl(self):
+        """
+        Qwen3-VL-8B-Instruct -- dense 8B, Apache 2.0, released 2025-10-15.
+        Native transformers support via Qwen3VLForConditionalGeneration
+        (confirmed importable against transformers==5.14.1 in a real,
+        current install; the actual weight download and forward-pass
+        behavior are UNVERIFIED here -- this environment has no
+        huggingface.co access, only pypi.org, so the class import could
+        be checked but not a real load). Same standard from_pretrained
+        kwargs as every other loader here (device_map, attn_implementation,
+        torch_dtype/quantization_config) -- no special-casing expected,
+        but confirm on the cluster before trusting it, same as every
+        other "verified against real code, not yet real weights" caveat
+        elsewhere in this project.
+
+        Qwen's own docs suggest flash_attention_2 for better memory
+        efficiency "especially in multi-image and video scenarios" --
+        not switched to by default here since this project only ever
+        passes a single static image per turn (no video), and eager is
+        what's already validated end-to-end for the other three loaders
+        in this same pipeline. Worth trying flash_attention_2 explicitly
+        if VRAM becomes a constraint, not assumed necessary here.
+        """
+        kwargs = self._base_kwargs()
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self.config.model_id, **kwargs
+        )
+        processor = AutoProcessor.from_pretrained(self.config.model_id)
+        return model, processor
+
+    def _load_gemma4(self):
+        """
+        Gemma 4 (Google DeepMind, released 2026-04-02, Apache 2.0).
+
+        Loaded via AutoModelForImageTextToText rather than a named class,
+        deliberately: the family ships TWO architectures --
+        Gemma4ForConditionalGeneration for E2B/E4B and
+        Gemma4UnifiedForConditionalGeneration for 12B/31B (confirmed by
+        reading each checkpoint's own config: 12B-it reports model_type
+        'gemma4_unified'). Hardcoding either class would break the other
+        for no benefit, and Auto* resolves both from the config.
+
+        Two properties that matter downstream, not just here:
+          - 48 decoder layers vs Qwen3-VL's 32, hidden size 3840 vs 4096.
+            extraction/hooks._resolve_target_layers takes the top 50-90%
+            of the stack, so the captured band is ~27-43 here against
+            18-31 for Qwen3-VL. ABSOLUTE layer indices are therefore NOT
+            comparable across the two models -- any cross-architecture
+            geometric claim must compare at matched RELATIVE depth.
+          - Gemma4UnifiedImageProcessor exposes none of
+            image_grid_pinpoints / crop_size / min_patches / max_patches,
+            so attacks.geometry_adapters.get_adapter() will raise for it.
+            Text attacks and non-gradient image attacks run unaffected;
+            the three pixel-space attacks need a new adapter first.
+        """
+        kwargs = self._base_kwargs()
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            self.config.model_id, **kwargs
+        )
+        processor = AutoProcessor.from_pretrained(self.config.model_id)
+        return model, processor
+
 
 # ---------------------------------------------------------------------------
 # Convenience factory functions
@@ -245,6 +336,56 @@ def load_internvl_8b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
     """
     cfg = LoadConfig(
         model_id="OpenGVLab/InternVL3-8B-hf",
+        dtype=torch.bfloat16,
+        device_map="auto" if hpc else "cpu",
+        attn_implementation="eager",
+    )
+    return VLMLoader(cfg).load()
+
+
+def load_gemma4_12b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
+    """
+    Gemma 4 12B-it -- second defensible architecture, added so RQ1's
+    cross-architecture claim rests on two current models rather than one.
+
+    Differs from the other three in ways that matter downstream:
+      - 48 transformer layers vs Qwen3-VL's 32, so _resolve_target_layers'
+        top-50-90% band is ~27-43 here, not 18-31. Absolute layer indices
+        are NOT comparable across models; compare at matched RELATIVE
+        depth.
+      - Gemma4UnifiedImageProcessor exposes none of image_grid_pinpoints,
+        crop_size, min_patches or max_patches, so none of the existing
+        geometry adapters match and get_adapter() will raise. Text-based
+        and image-producing-but-non-gradient attacks run fine; the three
+        pixel-space attacks need a new adapter first.
+      - ~24GB at bf16: biggpu only, will not fit bigbatch's 24GB cards.
+
+    bfloat16 and eager attention to match every other loader here --
+    the fp16/bf16 split between this file and the VWA-Adv driver was a
+    real confound and is not to be reintroduced.
+    """
+    cfg = LoadConfig(
+        model_id="google/gemma-4-12B-it",
+        dtype=torch.bfloat16,
+        device_map="auto" if hpc else "cpu",
+        attn_implementation="eager",
+    )
+    return VLMLoader(cfg).load()
+
+
+def load_qwen3vl_8b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
+    """
+    Qwen3-VL-8B-Instruct -- added as a 4th model specifically to test
+    whether the ~zero-ASR / never-exceeds-2-turns pattern seen with
+    LLaVA-NeXT 7B on real AgentDojo data is a base-model limitation or
+    something more structural to the pipeline/benchmark. See
+    VLMLoader._load_qwen3vl's docstring for what's verified (class
+    import against a real transformers install) versus not (the actual
+    weight download and forward pass, which needs cluster-side
+    verification -- this environment has no huggingface.co access).
+    """
+    cfg = LoadConfig(
+        model_id="Qwen/Qwen3-VL-8B-Instruct",
         dtype=torch.bfloat16,
         device_map="auto" if hpc else "cpu",
         attn_implementation="eager",

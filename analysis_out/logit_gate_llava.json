@@ -1,0 +1,120 @@
+{
+  "model": "llava",
+  "eps": 0.03137254901960784,
+  "results": [
+    {
+      "adapter": "anyres",
+      "plan_hw": [
+        672,
+        336
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 0.0001810966059565544,
+        "max_logit_delta": 0.171875,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 9.203027002513409e-05,
+        "max_logit_delta": 0.30078125,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_142_wrong_text_cap"
+    },
+    {
+      "adapter": "anyres",
+      "plan_hw": [
+        672,
+        336
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 0.0001810966059565544,
+        "max_logit_delta": 0.171875,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 9.203027002513409e-05,
+        "max_logit_delta": 0.30078125,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_142_wrong_text_cap_1"
+    },
+    {
+      "adapter": "anyres",
+      "plan_hw": [
+        672,
+        336
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 0.0001810966059565544,
+        "max_logit_delta": 0.171875,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 9.203027002513409e-05,
+        "max_logit_delta": 0.30078125,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_142_wrong_text_cap_2"
+    },
+    {
+      "adapter": "anyres",
+      "plan_hw": [
+        672,
+        336
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 2.0791543647646904e-05,
+        "max_logit_delta": 0.15625,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 4.037003964185715e-05,
+        "max_logit_delta": 0.72265625,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_143_wrong_text_cap"
+    },
+    {
+      "adapter": "anyres",
+      "plan_hw": [
+        672,
+        672
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": -4.2462488636374474e-08,
+        "max_logit_delta": 0.0322265625,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 0.00035304389894008636,
+        "max_logit_delta": 0.496612548828125,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_146_wrong_text_cap"
+    }
+  ],
+  "mean_kl_adapter": 0.00011280777980573475,
+  "mean_kl_control": 0.00013390094973146914,
+  "ratio": 0.84247184229809,
+  "verdict": "MARGINAL -- surrogate error same order as the attack signal"
+}

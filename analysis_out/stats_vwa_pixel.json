@@ -1,0 +1,172 @@
+{
+  "config": {
+    "results_dir": "vwa_adv_qwen3vl_pixel",
+    "layer": 31,
+    "n_perm": 500,
+    "out": "analysis_out/stats_vwa_pixel.json"
+  },
+  "reachability": {
+    "adversarial_patch": {
+      "n": 38,
+      "n_nonzero": 38,
+      "rate": 1.0,
+      "rate_ci95": [
+        0.90818706741616,
+        0.9999999999999999
+      ],
+      "delta_mean_all": 90.90013885498047,
+      "delta_mean_nonzero": 90.90013885498047,
+      "delta_median_nonzero": 85.03410339355469,
+      "delta_max": 167.34918212890625
+    },
+    "cross_modal_injection": {
+      "n": 38,
+      "n_nonzero": 38,
+      "rate": 1.0,
+      "rate_ci95": [
+        0.90818706741616,
+        0.9999999999999999
+      ],
+      "delta_mean_all": 88.93376159667969,
+      "delta_mean_nonzero": 88.93376159667969,
+      "delta_median_nonzero": 84.95472717285156,
+      "delta_max": 157.48129272460938
+    },
+    "pixel_perturbation": {
+      "n": 38,
+      "n_nonzero": 38,
+      "rate": 1.0,
+      "rate_ci95": [
+        0.90818706741616,
+        0.9999999999999999
+      ],
+      "delta_mean_all": 90.3059310913086,
+      "delta_mean_nonzero": 90.3059310913086,
+      "delta_median_nonzero": 83.68550109863281,
+      "delta_max": 169.03712463378906
+    }
+  },
+  "attack_comparison": [
+    {
+      "attack_a": "adversarial_patch",
+      "attack_b": "cross_modal_injection",
+      "n_pairs": 38,
+      "median_a": 85.03409957885742,
+      "median_b": 84.95472717285156,
+      "rank_biserial_r": 0.5789473684210527,
+      "wilcoxon_W": 202.0,
+      "p_raw": 0.013624320963572245,
+      "p_holm": 0.040872962890716735
+    },
+    {
+      "attack_a": "adversarial_patch",
+      "attack_b": "pixel_perturbation",
+      "n_pairs": 38,
+      "median_a": 85.03409957885742,
+      "median_b": 83.68550109863281,
+      "rank_biserial_r": 0.21052631578947367,
+      "wilcoxon_W": 278.0,
+      "p_raw": 0.18429159009247087,
+      "p_holm": 0.18429159009247087
+    },
+    {
+      "attack_a": "cross_modal_injection",
+      "attack_b": "pixel_perturbation",
+      "n_pairs": 38,
+      "median_a": 84.95472717285156,
+      "median_b": 83.68550109863281,
+      "rank_biserial_r": -0.3684210526315789,
+      "wilcoxon_W": 244.0,
+      "p_raw": 0.06727869343012571,
+      "p_holm": 0.13455738686025143
+    }
+  ],
+  "probe": {
+    "adversarial_patch": {
+      "n_samples": 76,
+      "n_pairs": 38,
+      "accuracy": 1.0,
+      "null_mean": 0.4968333333333333,
+      "null_p95": 0.6185897435897436,
+      "p_perm": 0.001996007984031936,
+      "n_perm": 500,
+      "p_holm": 0.005988023952095808
+    },
+    "cross_modal_injection": {
+      "n_samples": 76,
+      "n_pairs": 38,
+      "accuracy": 1.0,
+      "null_mean": 0.5059145299145299,
+      "null_p95": 0.628258547008547,
+      "p_perm": 0.001996007984031936,
+      "n_perm": 500,
+      "p_holm": 0.005988023952095808
+    },
+    "pixel_perturbation": {
+      "n_samples": 76,
+      "n_pairs": 38,
+      "accuracy": 1.0,
+      "null_mean": 0.4968461538461538,
+      "null_p95": 0.6314636752136752,
+      "p_perm": 0.001996007984031936,
+      "n_perm": 500,
+      "p_holm": 0.005988023952095808
+    }
+  },
+  "reach_vs_asr": [
+    {
+      "attack": "adversarial_patch",
+      "table": [
+        [
+          0,
+          38
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "asr_given_nonzero": 0.0,
+      "asr_given_zero": null,
+      "odds_ratio": null,
+      "p_raw": 1.0,
+      "p_holm": 1.0
+    },
+    {
+      "attack": "cross_modal_injection",
+      "table": [
+        [
+          0,
+          38
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "asr_given_nonzero": 0.0,
+      "asr_given_zero": null,
+      "odds_ratio": null,
+      "p_raw": 1.0,
+      "p_holm": 1.0
+    },
+    {
+      "attack": "pixel_perturbation",
+      "table": [
+        [
+          0,
+          38
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "asr_given_nonzero": 0.0,
+      "asr_given_zero": null,
+      "odds_ratio": null,
+      "p_raw": 1.0,
+      "p_holm": 1.0
+    }
+  ]
+}

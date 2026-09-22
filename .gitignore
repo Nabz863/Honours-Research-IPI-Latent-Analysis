@@ -5,3 +5,16 @@ __pycache__/
 *.pyc
 hf_cache/
 **/*.pt
+
+# Experimental output — regenerable, large. Tensors are already ignored
+# above, but attack_results.json is not and runs to megabytes per matrix.
+agentdojo_matrix_*/
+vwa_adv_*/
+model_preflight_*/
+wandb/
+*.save
+out.txt
+
+# Analysis outputs ARE committed: small JSON/CSV, and they are what the
+# write-up cites. Tensors and caches inside them stay ignored.
+vwa_adv_stepwise_diagnostic.png

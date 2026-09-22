@@ -1,0 +1,120 @@
+{
+  "model": "qwen3vl",
+  "eps": 0.03137254901960784,
+  "results": [
+    {
+      "adapter": "qwen_patch",
+      "plan_hw": [
+        512,
+        320
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 4,
+        "kl_nats": 2.3166405753727304e-06,
+        "max_logit_delta": 0.75,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 4.370392343844287e-05,
+        "max_logit_delta": 1.15625,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_142_wrong_text_cap"
+    },
+    {
+      "adapter": "qwen_patch",
+      "plan_hw": [
+        512,
+        320
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 4,
+        "kl_nats": 2.3166405753727304e-06,
+        "max_logit_delta": 0.75,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 4.370392343844287e-05,
+        "max_logit_delta": 1.15625,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_142_wrong_text_cap_1"
+    },
+    {
+      "adapter": "qwen_patch",
+      "plan_hw": [
+        512,
+        320
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 4,
+        "kl_nats": 2.3166405753727304e-06,
+        "max_logit_delta": 0.75,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 4.370392343844287e-05,
+        "max_logit_delta": 1.15625,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_142_wrong_text_cap_2"
+    },
+    {
+      "adapter": "qwen_patch",
+      "plan_hw": [
+        512,
+        320
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 4,
+        "kl_nats": 9.576926629506488e-08,
+        "max_logit_delta": 0.515625,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 3.79971279471647e-05,
+        "max_logit_delta": 0.890625,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_143_wrong_text_cap"
+    },
+    {
+      "adapter": "qwen_patch",
+      "plan_hw": [
+        512,
+        352
+      ],
+      "adapter_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 0.00022329810599330813,
+        "max_logit_delta": 0.75,
+        "rank_of_real_top1": 0
+      },
+      "eps_perturbed_vs_real": {
+        "top1_same": true,
+        "top5_overlap": 5,
+        "kl_nats": 5.882871482754126e-05,
+        "max_logit_delta": 1.125,
+        "rank_of_real_top1": 0
+      },
+      "image": "reddit_146_wrong_text_cap"
+    }
+  ],
+  "mean_kl_adapter": 4.6068759397144275e-05,
+  "mean_kl_control": 4.558752261800692e-05,
+  "ratio": 1.0105563266328332,
+  "verdict": "NOT USABLE -- surrogate perturbs the model more than the attack does"
+}

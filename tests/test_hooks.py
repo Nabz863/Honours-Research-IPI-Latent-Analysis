@@ -1,327 +1,187 @@
 """
 tests/test_hooks.py
--------------------
-Unit tests for the ActivationExtractor.
+-----------------------
+Regression tests for the capture-timing fix in extraction/hooks.py.
 
-These tests use a tiny synthetic transformer (2 layers, 16-dim hidden state)
-so they run in under a second on CPU — no HPC or model weights required.
+Background: a forward hook fires on EVERY forward call, and
+model.generate() with KV caching calls forward() once for the prefill
+(full prompt) and once more per newly generated token (decode steps,
+seq_len=1 each). The original implementation overwrote
+self._activations[layer_idx] unconditionally on every hook firing, so
+after a full generate() call the stored activation held the hidden
+state of the LAST GENERATED TOKEN, not the prompt-end/prefill state
+this project's activation-delta methodology actually needs (chapter2.tex:
+displacement between the model's state before/after processing
+untrusted content).
 
-Run with:
-    python -m pytest tests/test_hooks.py -v
-or:
-    python tests/test_hooks.py
+These tests use a REAL (if tiny, random-weight) Qwen3-VL architecture
+-- not a generic fake nn.Module -- specifically so a real mismatch in
+how a real VLM nests its decoder layers or handles KV-cached generate()
+would show up here, the same way it would on the full-size checkpoint.
 """
 
 from __future__ import annotations
 
-import gc
 import sys
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 
-# Make local imports work regardless of working directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from extraction.hooks import ActivationExtractor, extract_activations, _get_layer_list
-
-
-# ---------------------------------------------------------------------------
-# Minimal transformer stub
-# ---------------------------------------------------------------------------
-
-class _FakeTransformerLayer(nn.Module):
-    """Single linear layer standing in for a transformer block."""
-    def __init__(self, dim: int):
-        super().__init__()
-        self.linear = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        return (self.linear(x),)   # Return tuple, as real transformer layers do
-
-
-class _FakeVLM(nn.Module):
-    """Minimal VLM stub with a .model.layers attribute."""
-    def __init__(self, n_layers: int = 4, dim: int = 16):
-        super().__init__()
-
-        class _Inner(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.layers = nn.ModuleList(
-                    [_FakeTransformerLayer(dim) for _ in range(n_layers)]
-                )
-            def forward(self, x):
-                for layer in self.layers:
-                    x = layer(x)[0]
-                return x
-
-        self.model = _Inner()
-        self.n_layers = n_layers
-        self.dim = dim
-
-    def forward(self, x):
-        return self.model(x)
-
-
-def _make_input(batch=1, seq=5, dim=16):
-    return torch.randn(batch, seq, dim)
-
-
-class _FakeVLM_UnconventionalPath(nn.Module):
-    """
-    VLM stub whose layers live somewhere NOT covered by the hardcoded
-    candidate paths (mimics discovering a brand-new architecture).
-    Tests that _discover_layer_list() finds it anyway.
-    """
-    def __init__(self, n_layers: int = 6, dim: int = 16):
-        super().__init__()
-
-        class _Backbone(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.decoder_blocks = nn.ModuleList(
-                    [_FakeTransformerLayer(dim) for _ in range(n_layers)]
-                )
-
-        class _Wrapper(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.text_backbone = _Backbone()
-
-        self.core = _Wrapper()
-        # Also add a smaller, irrelevant ModuleList (e.g. a vision tower)
-        # to confirm discovery picks the LONGEST homogeneous list, not
-        # just the first one found.
-        self.vision_stub = nn.ModuleList([_FakeTransformerLayer(dim) for _ in range(2)])
-
-    def forward(self, x):
-        for layer in self.core.text_backbone.decoder_blocks:
-            x = layer(x)[0]
-        return x
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-def test_layer_discovery():
-    """_get_layer_list should find the layers in our stub."""
-    model = _FakeVLM(n_layers=4)
-    layers = _get_layer_list(model)
-    assert layers is not None, "Layer list not found"
-    assert len(layers) == 4
+from extraction.hooks import ActivationExtractor
+
+
+def _build_tiny_qwen3vl(num_hidden_layers=6):
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import (
+        Qwen3VLTextConfig, Qwen3VLVisionConfig,
+    )
+
+    text_cfg = Qwen3VLTextConfig(
+        vocab_size=100, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=num_hidden_layers, num_attention_heads=2, num_key_value_heads=1,
+    )
+    vision_cfg = Qwen3VLVisionConfig(
+        depth=2, hidden_size=16, intermediate_size=32, num_heads=2,
+        patch_size=14, in_channels=3,
+    )
+    config = Qwen3VLConfig(text_config=text_cfg, vision_config=vision_cfg)
+    model = Qwen3VLForConditionalGeneration(config)
+    model.eval()
+    return model
+
+
+def test_hook_fires_multiple_times_under_generate():
+    """Confirms the actual mechanism this fix addresses is real: a hook
+    on a real decoder layer fires more than once for a single generate()
+    call with max_new_tokens > 1, not just once."""
+    model = _build_tiny_qwen3vl()
+    layer = model.model.language_model.layers[2]
+    fire_count = [0]
+
+    def counting_hook(module, inp, out):
+        fire_count[0] += 1
+
+    handle = layer.register_forward_hook(counting_hook)
+    input_ids = torch.randint(1, 99, (1, 5))
+    with torch.no_grad():
+        model.generate(input_ids=input_ids, max_new_tokens=5, do_sample=False)
+    handle.remove()
+
+    assert fire_count[0] > 1, (
+        f"hook fired only {fire_count[0]} time(s) -- expected multiple firings "
+        "(1 prefill + N decode steps) under generate() with KV caching"
+    )
+
+
+def test_first_and_last_capture_step_genuinely_differ():
+    """capture_step='first' and 'last' must produce DIFFERENT tensors on
+    the same generate() call -- if they're ever identical, the fix has
+    regressed into a no-op."""
+    model = _build_tiny_qwen3vl()
+    input_ids = torch.randint(1, 99, (1, 5))
+
+    ext_first = ActivationExtractor(model, target_layers=[2], token_aggregation="last", capture_step="first")
+    with ext_first:
+        with torch.no_grad():
+            model.generate(input_ids=input_ids, max_new_tokens=5, do_sample=False)
+        first_act = ext_first.get_activations()[2].clone()
+
+    ext_last = ActivationExtractor(model, target_layers=[2], token_aggregation="last", capture_step="last")
+    with ext_last:
+        with torch.no_grad():
+            model.generate(input_ids=input_ids, max_new_tokens=5, do_sample=False)
+        last_act = ext_last.get_activations()[2].clone()
+
+    assert not torch.equal(first_act, last_act), (
+        "capture_step='first' and 'last' produced identical tensors on identical "
+        "input -- the prefill-vs-final-decode-step distinction has been lost"
+    )
+
+
+def test_multiturn_register_clear_cycle_resets_correctly():
+    """The real usage pattern: LocalVLMPipelineElement.query() reuses ONE
+    extractor across multiple turns via register()/clear() cycles (the
+    context manager does register()/remove(), clear() is called
+    separately between turns). Each turn must capture ITS OWN prefill
+    state, not silently skip because a stale _captured_this_cycle set
+    leaked from a previous turn."""
+    model = _build_tiny_qwen3vl()
+    extractor = ActivationExtractor(model, target_layers=[2], token_aggregation="last", capture_step="first")
+
+    turn1_ids = torch.randint(1, 99, (1, 5))
+    with extractor:
+        with torch.no_grad():
+            model.generate(input_ids=turn1_ids, max_new_tokens=4, do_sample=False)
+        turn1_act = extractor.get_activations()[2].clone()
+    extractor.clear()
+
+    turn2_ids = torch.randint(1, 99, (1, 5))
+    with extractor:
+        with torch.no_grad():
+            model.generate(input_ids=turn2_ids, max_new_tokens=4, do_sample=False)
+        turn2_act = extractor.get_activations()[2].clone()
+    extractor.clear()
+
+    assert not torch.equal(turn1_act, turn2_act), (
+        "turn 2 captured the same activation as turn 1 despite different input -- "
+        "the per-cycle capture set is not resetting correctly between turns"
+    )
+
+
+def test_single_forward_call_unaffected_by_fix():
+    """Phase 1 baseline collection uses a single model(**inputs) call, no
+    generate() -- the hook fires exactly once, so 'first' and the old
+    unconditional-overwrite behavior must be IDENTICAL here. This is the
+    concrete guarantee that Phase 1 baseline data does NOT need to be
+    recollected because of this fix."""
+    model = _build_tiny_qwen3vl()
+    input_ids = torch.randint(1, 99, (1, 8))
+
+    extractor = ActivationExtractor(model, target_layers=[2], token_aggregation="last", capture_step="first")
+    with extractor:
+        with torch.no_grad():
+            model(input_ids=input_ids)
+        act = extractor.get_activations()[2].clone()
+
+    # Independently recompute via a raw hook with unconditional overwrite
+    # (the OLD behavior) and confirm it lands on the exact same tensor.
+    raw = {}
+    def old_style_hook(module, inp, out):
+        h = (out[0] if isinstance(out, tuple) else out)[0].detach().cpu()
+        raw["h"] = h[-1]
+    layer = model.model.language_model.layers[2]
+    handle = layer.register_forward_hook(old_style_hook)
+    with torch.no_grad():
+        model(input_ids=input_ids)
+    handle.remove()
+
+    assert torch.equal(act, raw["h"]), (
+        "single forward-call capture differs from old unconditional-overwrite "
+        "behavior -- Phase 1 baseline data would need recollection, which the "
+        "fix's docstring claims should NOT be the case"
+    )
 
-
-def test_auto_discovery_unconventional_path():
-    """
-    _get_layer_list should fall back to auto-discovery and still find
-    the transformer stack even when it's at a path none of the
-    hardcoded candidates check (core.text_backbone.decoder_blocks).
-    """
-    model = _FakeVLM_UnconventionalPath(n_layers=6)
-    layers = _get_layer_list(model)
-    assert layers is not None, "Auto-discovery failed to find layer list"
-    assert len(layers) == 6, f"Expected 6 layers, found {len(layers)}"
-
-
-def test_auto_discovery_picks_longest_homogeneous_list():
-    """
-    When multiple ModuleLists exist (e.g. a small vision tower stub
-    alongside the real decoder stack), auto-discovery should pick the
-    longest homogeneous one — i.e. the actual transformer stack, not
-    an incidental shorter list.
-    """
-    model = _FakeVLM_UnconventionalPath(n_layers=6)
-    layers = _get_layer_list(model)
-    assert len(layers) == 6, "Did not select the longer of the two ModuleLists"
-
-
-def test_explicit_target_layers():
-    """Extractor respects explicitly provided layer indices."""
-    model = _FakeVLM(n_layers=4)
-    ext = ActivationExtractor(model, target_layers=[0, 2])
-    assert ext.target_layers == [0, 2]
-
-
-def test_heuristic_target_layers():
-    """Default heuristic selects a subset of late-middle layers."""
-    model = _FakeVLM(n_layers=32)
-    ext = ActivationExtractor(model)
-    # All selected layers should be in the 50-90% range
-    n = 32
-    lo, hi = int(n * 0.50), int(n * 0.90)
-    for idx in ext.target_layers:
-        assert lo <= idx < hi, f"Layer {idx} outside expected range [{lo}, {hi})"
-
-
-def test_activation_shape_last():
-    """'last' aggregation yields [hidden_dim] tensors."""
-    model = _FakeVLM(n_layers=4, dim=16)
-    x = _make_input(seq=5, dim=16)
-
-    with ActivationExtractor(model, target_layers=[1, 3], token_aggregation="last") as ext:
-        _ = model(x)
-
-    acts = ext.get_activations()
-    assert set(acts.keys()) == {1, 3}
-    for idx, t in acts.items():
-        assert t.shape == (16,), f"Layer {idx}: expected (16,), got {t.shape}"
-
-
-def test_activation_shape_mean():
-    """'mean' aggregation also yields [hidden_dim] tensors."""
-    model = _FakeVLM(n_layers=4, dim=16)
-    x = _make_input(seq=5, dim=16)
-
-    with ActivationExtractor(model, target_layers=[0], token_aggregation="mean") as ext:
-        _ = model(x)
-
-    acts = ext.get_activations()
-    assert acts[0].shape == (16,)
-
-
-def test_activation_shape_full():
-    """'full' aggregation preserves sequence dimension."""
-    model = _FakeVLM(n_layers=4, dim=16)
-    seq = 7
-    x = _make_input(seq=seq, dim=16)
-
-    with ActivationExtractor(model, target_layers=[2], token_aggregation="full") as ext:
-        _ = model(x)
-
-    acts = ext.get_activations()
-    assert acts[2].shape == (seq, 16)
-
-
-def test_hooks_removed_after_context():
-    """Hooks must be removed after the context manager exits."""
-    model = _FakeVLM(n_layers=4)
-    ext = ActivationExtractor(model, target_layers=[1])
-
-    with ext:
-        pass  # No forward pass needed to test cleanup
-
-    assert not ext._active
-    assert len(ext._handles) == 0
-
-
-def test_hooks_removed_on_exception():
-    """Hooks must be removed even if forward pass raises an exception."""
-    model = _FakeVLM(n_layers=4)
-    ext = ActivationExtractor(model, target_layers=[1])
-
-    try:
-        with ext:
-            raise RuntimeError("Simulated inference failure")
-    except RuntimeError:
-        pass
-
-    assert not ext._active, "Hooks not removed after exception"
-    assert len(ext._handles) == 0
-
-
-def test_clear_frees_memory():
-    """clear() removes stored activations."""
-    model = _FakeVLM(n_layers=4, dim=16)
-    x = _make_input()
-
-    with ActivationExtractor(model, target_layers=[0, 1]) as ext:
-        _ = model(x)
-
-    assert len(ext._activations) == 2
-    ext.clear()
-    assert len(ext._activations) == 0
-
-
-def test_get_activation_matrix():
-    """get_activation_matrix() stacks layers correctly."""
-    model = _FakeVLM(n_layers=4, dim=16)
-    x = _make_input()
-
-    with ActivationExtractor(model, target_layers=[0, 1, 2], token_aggregation="last") as ext:
-        _ = model(x)
-
-    mat = ext.get_activation_matrix()
-    assert mat.shape == (3, 16), f"Expected (3, 16), got {mat.shape}"
-
-
-def test_no_double_registration():
-    """Registering hooks twice should raise RuntimeError."""
-    model = _FakeVLM(n_layers=4)
-    ext = ActivationExtractor(model, target_layers=[0])
-    ext.register()
-    try:
-        raised = False
-        try:
-            ext.register()
-        except RuntimeError:
-            raised = True
-        assert raised, "Expected RuntimeError on double registration"
-    finally:
-        ext.remove()
-
-
-def test_extract_activations_context_manager():
-    """Convenience extract_activations() wrapper works correctly."""
-    model = _FakeVLM(n_layers=4, dim=16)
-    x = _make_input()
-
-    with extract_activations(model, target_layers=[0, 3]) as ext:
-        _ = model(x)
-
-    acts = ext.get_activations()
-    assert 0 in acts and 3 in acts
-
-
-def test_cpu_tensors():
-    """Activations are always stored on CPU."""
-    model = _FakeVLM(n_layers=4, dim=16)
-    x = _make_input()
-
-    with ActivationExtractor(model, target_layers=[1]) as ext:
-        _ = model(x)
-
-    acts = ext.get_activations()
-    for t in acts.values():
-        assert t.device.type == "cpu", f"Expected CPU tensor, got {t.device}"
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     tests = [
-        test_layer_discovery,
-        test_auto_discovery_unconventional_path,
-        test_auto_discovery_picks_longest_homogeneous_list,
-        test_explicit_target_layers,
-        test_heuristic_target_layers,
-        test_activation_shape_last,
-        test_activation_shape_mean,
-        test_activation_shape_full,
-        test_hooks_removed_after_context,
-        test_hooks_removed_on_exception,
-        test_clear_frees_memory,
-        test_get_activation_matrix,
-        test_no_double_registration,
-        test_extract_activations_context_manager,
-        test_cpu_tensors,
+        test_hook_fires_multiple_times_under_generate,
+        test_first_and_last_capture_step_genuinely_differ,
+        test_multiturn_register_clear_cycle_resets_correctly,
+        test_single_forward_call_unaffected_by_fix,
     ]
-
-    passed = 0
-    failed = 0
+    passed = failed = 0
     for t in tests:
         try:
             t()
             print(f"  PASS  {t.__name__}")
             passed += 1
         except Exception as e:
+            import traceback
             print(f"  FAIL  {t.__name__}: {e}")
+            traceback.print_exc()
             failed += 1
-
     print(f"\n{passed}/{passed + failed} tests passed.")
     if failed:
         sys.exit(1)

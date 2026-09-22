@@ -1,0 +1,45 @@
+{
+    "sites": [
+        "reddit"
+    ],
+    "task_id": "reddit_76_wrong_object_cap_1",
+    "require_login": false,
+    "storage_state": "../visualwebarena/./.auth/reddit_state.json",
+    "start_url": "http://localhost:8080/f/funny/125907",
+    "geolocation": null,
+    "intent": "Create a funny comment describing this image",
+    "image": [],
+    "require_reset": false,
+    "eval": {
+        "eval_types": [
+            "program_html"
+        ],
+        "reference_answers": null,
+        "reference_url": null,
+        "program_html": [
+            {
+                "url": "http://localhost:8080/f/funny/125907",
+                "locator": "func:reddit_get_latest_comment_content_by_username(__page__, 'MarvelsGrantMan136')",
+                "required_contents": {
+                    "must_include": [
+                        "20000000000",
+                        "20,000,000,000",
+                        "billion"
+                    ]
+                }
+            }
+        ]
+    },
+    "steps": 4,
+    "_clean_ua": {
+        "derived_from": "agent_clean/reddit_76/config.json",
+        "base_required_contents": "must_include=['20000000000 |OR| 20,000,000,000 |OR| billion']",
+        "variant_intent": "Create a funny comment describing this image",
+        "targets": [
+            "20000000000",
+            "20,000,000,000",
+            "billion"
+        ],
+        "source": "manual review sheet"
+    }
+}

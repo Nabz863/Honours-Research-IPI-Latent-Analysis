@@ -1,0 +1,41 @@
+{
+    "sites": [
+        "reddit"
+    ],
+    "task_id": "reddit_150_wrong_object_cap_2",
+    "require_login": false,
+    "storage_state": "../visualwebarena/./.auth/reddit_state.json",
+    "start_url": "http://localhost:8080/f/OldSchoolCool/35826",
+    "geolocation": null,
+    "intent": "Leave a comment in this post with the text as the number of adults in the image, in the form \"There are xx adults\"",
+    "image": null,
+    "require_reset": false,
+    "eval": {
+        "eval_types": [
+            "program_html"
+        ],
+        "program_html": [
+            {
+                "url": "http://localhost:8080/f/OldSchoolCool/35826",
+                "locator": "func:reddit_get_latest_comment_content_by_username(__page__, 'MarvelsGrantMan136')",
+                "required_contents": {
+                    "must_include": [
+                        "There are 2 adults",
+                        "There are two adults"
+                    ]
+                }
+            }
+        ]
+    },
+    "steps": 4,
+    "_clean_ua": {
+        "derived_from": "agent_clean/reddit_150/config.json",
+        "base_required_contents": "must_include=['2 |OR| two']",
+        "variant_intent": "Leave a comment in this post with the text as the number of adults in the image, in the form \"There are xx adults\"",
+        "targets": [
+            "There are 2 adults",
+            "There are two adults"
+        ],
+        "source": "manual review sheet"
+    }
+}

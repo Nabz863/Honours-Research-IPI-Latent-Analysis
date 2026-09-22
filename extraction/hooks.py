@@ -16,6 +16,35 @@ Design goals (per Phase 1 requirements):
   - Minimal overhead: stores activations as detached CPU tensors to avoid
     holding GPU memory between inference calls.
 
+CAPTURE-TIMING FIX (this version): a forward hook fires on EVERY forward
+call, and model.generate() with KV caching calls forward() once per
+step -- the first call sees the full prompt (prefill), every call after
+that sees only the single newest token (decode steps, seq_len=1). The
+original version of this file overwrote self._activations[layer_idx]
+unconditionally on every call, so anything captured while wrapped around
+generate() (both environments/agentdojo_llm.py's turn_activations and
+environments/vwa_adv_llm.py's step_activations do this) ended up holding
+the hidden state of the LAST GENERATED TOKEN from the final decode step,
+not "the model's state after reading the (possibly injected) prompt" --
+which is what this project's own activation-delta methodology
+(chapter2.tex: displacement between the model's state before/after
+processing untrusted content) actually needs. Confirmed as a real,
+reproducible issue (not a hypothetical) via a minimal fake-layer
+forward-hook test before this fix was written, and independently
+re-verified against a real (tiny, random-weight) Qwen3-VL architecture:
+the hook fires multiple times per generate() call, and the old
+unconditional-overwrite tensor and the new first-only tensor are
+provably different on identical input -- this is not a no-op change.
+
+Fixed via capture_step (see ActivationExtractor's docstring): default
+'first' captures only the prefill call per register()/clear() cycle.
+For a single model(**inputs) call (Phase 1 baseline collection -- hook
+fires exactly once), 'first' and the old always-overwrite behavior are
+identical -- no change there, and Phase 1 baseline data does NOT need
+to be recollected. 'last' (the original, unconditional-overwrite
+behavior) is kept available and explicitly opt-in, in case some future
+use genuinely wants the final-token signal instead.
+
 Usage:
     extractor = ActivationExtractor(model, target_layers=[16, 20, 24, 28])
     with extractor:
@@ -28,7 +57,7 @@ from __future__ import annotations
 
 import gc
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 import torch
 import torch.nn as nn
@@ -47,10 +76,6 @@ def _resolve_target_layers(model: nn.Module, target_layers: Optional[Sequence[in
     layers which are task-specific and the early layers which encode
     surface features rather than semantics).
     """
-    # Try to find the transformer layer list in common VLM architectures.
-    # LLaVA-NeXT: model.language_model.model.layers
-    # Qwen2-VL:   model.model.layers
-    # InternVL:   model.language_model.model.layers
     layer_list = _get_layer_list(model)
 
     if layer_list is None:
@@ -62,7 +87,6 @@ def _resolve_target_layers(model: nn.Module, target_layers: Optional[Sequence[in
     n = len(layer_list)
 
     if target_layers is not None:
-        # Validate provided indices
         invalid = [i for i in target_layers if not (0 <= i < n)]
         if invalid:
             raise ValueError(
@@ -70,10 +94,8 @@ def _resolve_target_layers(model: nn.Module, target_layers: Optional[Sequence[in
             )
         return list(target_layers)
 
-    # Late-middle heuristic: layers from 50% to 90% of depth
     lo = int(n * 0.50)
     hi = int(n * 0.90)
-    # Sample at most every 2 layers to reduce memory pressure on 13B models
     step = max(1, (hi - lo) // 8)
     return list(range(lo, hi, step))
 
@@ -87,23 +109,18 @@ def _get_layer_list(model: nn.Module):
     1. Fast path: try known attribute paths for common architectures.
        Checked first because they're unambiguous when correct.
     2. Auto-discovery fallback: walk the full module tree and collect every
-       nn.ModuleList. Score each by (a) length — transformer stacks are
-       typically >= 4 layers, and (b) homogeneity — every element should be
+       nn.ModuleList. Score each by (a) length -- transformer stacks are
+       typically >= 4 layers, and (b) homogeneity -- every element should be
        the same type, since a real transformer stack is N copies of one
        block class. Return the longest homogeneous ModuleList found.
        This means new/unseen VLM architectures are supported automatically,
        without requiring a hardcoded path for every model family.
     """
     candidates = [
-        # Qwen2-VL / generic
         lambda m: m.model.layers,
-        # LLaVA-NeXT (language_model is itself the LM, not wrapped in .model)
         lambda m: m.language_model.layers,
-        # Some LLaVA / InternVL variants wrap one level deeper
         lambda m: m.language_model.model.layers,
-        # Bare LlamaModel
         lambda m: m.model.model.layers,
-        # Direct
         lambda m: m.layers,
     ]
     for fn in candidates:
@@ -135,8 +152,6 @@ def _discover_layer_list(model: nn.Module, min_layers: int = 4):
         if len(module) < min_layers:
             continue
 
-        # Homogeneity check: every block should be the same class,
-        # as in a real transformer stack (N copies of one decoder layer).
         types = {type(sub) for sub in module}
         if len(types) != 1:
             continue
@@ -162,12 +177,32 @@ class ActivationExtractor:
     model : nn.Module
         The loaded VLM (must be in eval mode before extraction).
     target_layers : list[int] | None
-        Indices of transformer layers to hook.  None → late-middle heuristic.
+        Indices of transformer layers to hook.  None -> late-middle heuristic.
     token_aggregation : str
         How to reduce the sequence dimension of collected activations.
         - 'last'  : last non-padding token (good for causal LMs)
         - 'mean'  : mean over all tokens
         - 'full'  : keep full [seq_len, hidden_dim] tensor (large!)
+    capture_step : str
+        WHICH forward call to capture from, when hooks fire more than
+        once per register()/clear() cycle -- this happens whenever the
+        extractor is wrapped around model.generate() with KV caching:
+        one forward call for the prompt/prefill (full sequence), then
+        one more per newly generated token (seq_len=1 each).
+        - 'first' (default) : capture only the FIRST forward call this
+          cycle -- the prefill pass over the full prompt. This is "the
+          model's state right after reading the (possibly injected)
+          prompt, before generating a response" -- the activation-delta
+          target this project's methodology actually needs. For a
+          single model(**inputs) call (no generate(), hook fires once),
+          'first' is identical to the old unconditional-overwrite
+          behavior -- Phase 1 baseline collection is unaffected.
+        - 'last' : capture whichever call happens to run last,
+          overwriting every time (this file's ORIGINAL behavior). Under
+          generate() + caching this ends up being the hidden state of
+          the FINAL GENERATED TOKEN, not the prompt-end state. Kept
+          available, explicitly opt-in, in case some future use
+          genuinely wants that signal.
     """
 
     def __init__(
@@ -175,18 +210,21 @@ class ActivationExtractor:
         model: nn.Module,
         target_layers: Optional[Sequence[int]] = None,
         token_aggregation: str = "last",
+        capture_step: str = "first",
     ):
         if token_aggregation not in ("last", "mean", "full"):
             raise ValueError("token_aggregation must be 'last', 'mean', or 'full'.")
+        if capture_step not in ("first", "last"):
+            raise ValueError("capture_step must be 'first' or 'last'.")
 
         self.model = model
         self.token_aggregation = token_aggregation
+        self.capture_step = capture_step
         self._target_indices: List[int] = _resolve_target_layers(model, target_layers)
         self._layer_list = _get_layer_list(model)
 
-        # Storage: {layer_idx -> tensor}
         self._activations: Dict[int, torch.Tensor] = {}
-        # Registered hook handles (for guaranteed removal)
+        self._captured_this_cycle: Set[int] = set()
         self._handles: List[torch.utils.hooks.RemovableHook] = []
 
         self._active = False
@@ -208,6 +246,8 @@ class ActivationExtractor:
         if self._active:
             raise RuntimeError("Hooks already registered. Call remove() first.")
 
+        self._captured_this_cycle = set()
+
         for idx in self._target_indices:
             layer = self._layer_list[idx]
             handle = layer.register_forward_hook(self._make_hook(idx))
@@ -225,6 +265,7 @@ class ActivationExtractor:
     def clear(self) -> None:
         """Delete stored activations and free GPU/CPU memory."""
         self._activations.clear()
+        self._captured_this_cycle = set()
         gc.collect()
 
     def get_activations(self) -> Dict[int, torch.Tensor]:
@@ -270,7 +311,7 @@ class ActivationExtractor:
         return self
 
     def __exit__(self, *_) -> None:
-        # Always remove hooks, even on exception — this is the primary
+        # Always remove hooks, even on exception -- this is the primary
         # guard against memory leaks in long-context agentic tasks.
         self.remove()
 
@@ -282,19 +323,30 @@ class ActivationExtractor:
         """Return a closure that captures activations for layer_idx."""
 
         def hook(module, input, output):
-            # output is typically a tuple; first element is the hidden state
+            if self.capture_step == "first" and layer_idx in self._captured_this_cycle:
+                # Already captured this layer's prefill state this cycle --
+                # this call is a later decode step (seq_len=1), ignore it.
+                return
+
             hidden = output[0] if isinstance(output, tuple) else output
 
-            # hidden shape: [batch, seq_len, hidden_dim]
-            # We assume batch size 1 for single-inference extraction
             h = hidden[0].detach().cpu()  # [seq_len, hidden_dim]
 
             if self.token_aggregation == "last":
-                self._activations[layer_idx] = h[-1]          # [hidden_dim]
+                # .clone() is REQUIRED, not cosmetic: h[-1] is a VIEW into the
+                # full [seq_len, hidden_dim] tensor, and torch.save() serialises
+                # a view's ENTIRE underlying storage. Without this, every saved
+                # "[4096] activation" silently carries its whole parent sequence
+                # -- confirmed by a 109GB clean_activations_cache.pt (~380MB per
+                # task, vs ~16KB for a real fp32 [4096] vector), and by ~10min of
+                # per-episode overhead spent rewriting it.
+                self._activations[layer_idx] = h[-1].clone()  # [hidden_dim]
             elif self.token_aggregation == "mean":
                 self._activations[layer_idx] = h.mean(dim=0)  # [hidden_dim]
             else:  # 'full'
                 self._activations[layer_idx] = h              # [seq_len, hidden_dim]
+
+            self._captured_this_cycle.add(layer_idx)
 
         return hook
 
@@ -308,6 +360,7 @@ def extract_activations(
     model: nn.Module,
     target_layers: Optional[Sequence[int]] = None,
     token_aggregation: str = "last",
+    capture_step: str = "first",
 ):
     """
     Thin context manager wrapper around ActivationExtractor.
@@ -318,7 +371,7 @@ def extract_activations(
         output = model(**inputs)
     acts = ext.get_activations()
     """
-    ext = ActivationExtractor(model, target_layers, token_aggregation)
+    ext = ActivationExtractor(model, target_layers, token_aggregation, capture_step)
     try:
         ext.register()
         yield ext
