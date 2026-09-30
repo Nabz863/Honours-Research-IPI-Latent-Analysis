@@ -225,7 +225,8 @@ def train_prober(
 # 3. Mitigating Rectifier (Eq. 11-12)
 # ---------------------------------------------------------------------------
 def steer_attention_scores(
-    scores: torch.Tensor, head_indices: Sequence[int], tau: float, gamma: float
+    scores: torch.Tensor, head_indices: Sequence[int], tau: float, gamma: float,
+    attention_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Eq. 11-12, applied to PRE-SOFTMAX attention scores.
@@ -240,19 +241,35 @@ def steer_attention_scores(
     probability mass across the rest of the context, which is where the
     benign task tokens are. Applying the same scaling after the softmax
     would simply shrink those weights and leave the distribution unnormalised.
+
+    AUDIT 13.8 -- two corrections to the original implementation:
+      * Scaling a raw score by gamma is not suppression: for a NEGATIVE
+        score, gamma < 1 moves it toward zero and RAISES its attention
+        weight. The sign-safe operation with the stated meaning ("scale
+        the weight by gamma, then renormalise") is adding log(gamma) to the
+        score: softmax(s + log g) is proportional to g * exp(s).
+      * The top-tau threshold was taken over every key, including future
+        positions the causal mask removes during prefill. It is now taken
+        over the keys the mask leaves visible.
     """
     if not head_indices or gamma >= 1.0:
         return scores
+    import math
+    log_g = math.log(max(gamma, 1e-12))
     out = scores.clone()
     for h in head_indices:
         if h >= scores.shape[1]:
             continue
         head = out[:, h]                                # [B, Q, K]
-        # theta = (1 - tau) percentile along the key axis, per query row.
+        visible = head
+        if attention_mask is not None:
+            m = attention_mask[:, 0] if attention_mask.dim() == 4 else attention_mask
+            visible = head + m[..., : head.shape[-1]].to(head.dtype)
+        # theta = (1 - tau) percentile along the visible keys, per query row.
         k = max(1, int(head.shape[-1] * tau))
-        thresh = head.topk(k, dim=-1).values[..., -1:].expand_as(head)
-        mask = (head >= thresh).to(head.dtype)
-        out[:, h] = head * (1.0 + mask * (gamma - 1.0))
+        thresh = visible.topk(k, dim=-1).values[..., -1:].expand_as(head)
+        sel = (visible >= thresh) & torch.isfinite(visible)
+        out[:, h] = head + sel.to(head.dtype) * log_g
     return out
 
 
@@ -337,8 +354,10 @@ class MitigatingRectifier:
                     )
 
             if heads:
+                am = attention_mask[:, :, :, : k.shape[-2]] if attention_mask is not None else None
                 scores = steer_attention_scores(scores, heads,
-                                                rectifier.tau, rectifier.gamma)
+                                                rectifier.tau, rectifier.gamma,
+                                                attention_mask=am)
             if attention_mask is not None:
                 scores = scores + attention_mask[:, :, :, : k.shape[-2]]
             probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)

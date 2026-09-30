@@ -82,7 +82,7 @@ that needs postmill.sif confirmed working on the cluster first.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -240,14 +240,19 @@ class HFTokenizerAdapter:
     def __init__(self, processor: Any):
         self.tokenizer = getattr(processor, "tokenizer", processor)
 
+    # add_special_tokens=False: VWA truncates the observation with
+    # decode(encode(obs)[:max_obs_length]). A tokenizer that adds BOS on
+    # encode (LLaVA-NeXT's '<s>') would otherwise put a literal BOS string
+    # in the middle of the prompt (audit 11.10; Qwen3-VL, InternVL3 and
+    # Gemma 4 add none, so this changes nothing for them).
     def encode(self, text: str) -> List[int]:
-        return self.tokenizer.encode(text)
+        return self.tokenizer.encode(text, add_special_tokens=False)
 
     def decode(self, ids: List[int]) -> str:
         return self.tokenizer.decode(ids)
 
     def __call__(self, text: str) -> List[int]:
-        return self.tokenizer.encode(text)
+        return self.encode(text)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +271,8 @@ class LocalVLMBackend:
     """
 
     def __init__(self, model: Any, processor: Any, extractor: Any, max_new_tokens: int = 512,
-                 defense: Any = None, ecso: Any = None):
+                 defense: Any = None, ecso: Any = None, task_intent: Optional[str] = None,
+                 payload_markers: Optional[List[str]] = None):
         self.model = model
         self.processor = processor
         self.extractor = extractor
@@ -295,6 +301,22 @@ class LocalVLMBackend:
         self.ecso = ecso
         self.ecso_info: List[Dict[str, Any]] = []
         self._defense_cache: Dict[str, Any] = {}
+        # The user's own task, for ECSO's {query} slot (audit 13.2): the
+        # last user message is the whole observation, injection included.
+        self.task_intent = task_intent
+        # Reachability, per agent step (audit 11.11): does the injected
+        # caption text appear in the prompt the model is given? Checked on
+        # the prompt BEFORE any defence transforms it.
+        self.payload_markers = [m for m in (payload_markers or []) if m]
+        self.payload_in_prompt: List[bool] = []
+        # Greedy decoding makes a parse-failure retry identical to the call
+        # it retries; VWA's PromptAgent re-calls with the SAME prompt
+        # object. Returning the previous response keeps step_activations one
+        # entry per decision and saves the compute (audit 11.9).
+        self._last_prompt: Any = None
+        self._last_response: Optional[str] = None
+        self.retries_deduplicated = 0
+        self.defense_unmatched_steps = 0
 
     def generate(self, prompt: Dict[str, Any]) -> str:
         """Apply defences, then generate once.
@@ -303,16 +325,32 @@ class LocalVLMBackend:
         for each of its four steps without re-applying defences or
         re-deriving the decode logic.
         """
+        if prompt is self._last_prompt and self._last_response is not None:
+            self.retries_deduplicated += 1
+            return self._last_response
+
         conversation = prompt["conversation"]
         images = prompt["images"]
 
+        if self.payload_markers:
+            raw_text = " ".join(
+                b.get("text", "") for m in conversation for b in (m.get("content") or [])
+                if isinstance(b, dict) and b.get("type") == "text")
+            self.payload_in_prompt.append(any(mk in raw_text for mk in self.payload_markers))
+
         if self.defense is not None:
-            conversation = self._defend(conversation)
+            if not getattr(self.defense, "page_level", False):
+                conversation = self._defend(conversation)
             # Visual defences transform the IMAGE, not the text. The
             # default apply_image() added by defenses.visual is the
             # identity, so text defences pass through unchanged and this
-            # needs no branching on defence type.
+            # needs no branching on defence type. A PAGE-LEVEL visual
+            # defence (blur on page images, audit 13.4 / D3) is applied in
+            # the browser and the captioner instead, never to the whole
+            # screenshot here.
             ai = getattr(self.defense, "apply_image", None)
+            if getattr(self.defense, "page_level", False):
+                ai = None
             if ai is not None and images:
                 defended = []
                 for im in images:
@@ -324,8 +362,11 @@ class LocalVLMBackend:
                 images = defended
 
         if getattr(self, "ecso", None) is not None:
-            return self._ecso_generate(conversation, images)
-        return self._raw_generate(conversation, images)
+            out = self._ecso_generate(conversation, images)
+        else:
+            out = self._raw_generate(conversation, images)
+        self._last_prompt, self._last_response = prompt, out
+        return out
 
     def _raw_generate(self, conversation, images, max_new_tokens=None) -> str:
         """One generation with activation capture. max_new_tokens is
@@ -388,18 +429,53 @@ class LocalVLMBackend:
         def gen(conv, imgs, n):
             return self._raw_generate(conv, imgs, max_new_tokens=n)
 
-        r = self.ecso.run(gen, conversation, images)
-        # Keep only the FINAL generation's activations as this step's.
-        # ECSO's detect and caption passes are diagnostic, not the
-        # agent's actual decision, and four entries where every other
-        # condition has one would break the per-step pairing RQ2 needs.
-        if len(self.step_activations) > mark + 1:
-            self.step_activations[mark:] = [self.step_activations[-1]]
-        self.ecso_info.append(r.metadata)
+        r = self.ecso.run(gen, conversation, images, query=self.task_intent)
+        # Keep the activations of the generation whose output is RETURNED
+        # as the agent's decision -- one entry per step, like every other
+        # condition. Unflagged: that is the initial answer (entry `mark`);
+        # keeping the last entry, as before, kept the DETECTOR prompt's
+        # activation (audit 13.1). Flagged: the image-free regeneration
+        # (the last entry).
+        entries = self.step_activations[mark:]
+        if entries:
+            keep = entries[-1] if r.flagged else entries[0]
+            self.step_activations[mark:] = [keep]
+        meta = dict(r.metadata)
+        meta["activation_kept"] = "regeneration" if r.flagged else "initial_answer"
+        self.ecso_info.append(meta)
         return r.response
 
+    _OBS_RE = None
+
+    def _defend_text(self, raw: str) -> Tuple[str, Optional[str], bool]:
+        """Defends ONLY the observation inside VWA's template block
+        ('OBSERVATION: ... \nURL: ...\nOBJECTIVE: ...'), leaving the URL,
+        the user's objective and the previous action untouched (audit
+        11.3). Returns (text, addendum, matched_template)."""
+        import re as _re
+        if LocalVLMBackend._OBS_RE is None:
+            LocalVLMBackend._OBS_RE = _re.compile(r"\A(OBSERVATION:[ \t]*\n?)(.*?)(\nURL:)", _re.DOTALL)
+        m = LocalVLMBackend._OBS_RE.match(raw)
+        if not m:
+            return raw, None, False
+        obs = m.group(2)
+        if obs not in self._defense_cache:
+            self._defense_cache[obs] = self.defense.apply(obs)
+        r = self._defense_cache[obs]
+        return (m.group(1) + r.transformed_content + raw[m.start(3):],
+                r.system_prompt_addendum or None, True)
+
     def _defend(self, conversation):
-        """Transforms every user-role text block through the defense.
+        """Defends the untrusted observation and tells the model how
+        (audits 11.2, 11.3). Only the OBSERVATION section of the user turn
+        is transformed; the objective is the user's own and is left as is.
+        The defence's system_prompt_addendum is appended to the system
+        message -- previously it was collected and never delivered, so on
+        this benchmark content was marked but the model was never told
+        what the marking meant.
+
+        Previous docstring, kept for the caching rationale:
+        Transforms every user-role text block through the defense.
         Cached by raw text for the same reason agentdojo_llm.py caches:
         the conversation is rebuilt every step, and a defense with any
         per-call randomness (spotlighting's delimiting variant generates
@@ -407,6 +483,8 @@ class LocalVLMBackend:
         same historical observation differently on every step, so the
         model would see its own history appear to change."""
         out = []
+        addenda: List[str] = []
+        matched_any = False
         for msg in conversation:
             if msg.get("role") != "user":
                 out.append(msg)
@@ -414,18 +492,40 @@ class LocalVLMBackend:
             blocks = []
             for b in msg.get("content", []):
                 if isinstance(b, dict) and b.get("type") == "text":
-                    raw = b.get("text", "")
-                    if raw not in self._defense_cache:
-                        self._defense_cache[raw] = self.defense.apply(raw)
-                    r = self._defense_cache[raw]
-                    if (r.system_prompt_addendum
-                            and r.system_prompt_addendum not in self.defense_addenda):
-                        self.defense_addenda.append(r.system_prompt_addendum)
-                    blocks.append({"type": "text", "text": r.transformed_content})
+                    text, add, matched = self._defend_text(b.get("text", ""))
+                    matched_any = matched_any or matched
+                    if matched and add and add not in addenda:
+                        addenda.append(add)
+                    blocks.append({"type": "text", "text": text})
                 else:
                     blocks.append(b)
             out.append({**msg, "content": blocks})
-        return out
+        for a in addenda:
+            if a not in self.defense_addenda:
+                self.defense_addenda.append(a)
+        if not matched_any:
+            # A text defence that found no OBSERVATION block defended
+            # nothing. Counted and recorded on the row, never silent.
+            self.defense_unmatched_steps += 1
+        if not addenda:
+            return out
+        prov = "\n\n## Content Provenance\n\n" + "\n\n".join(addenda)
+        final = []
+        patched = False
+        for msg in out:
+            if msg.get("role") == "system" and not patched:
+                blocks = list(msg.get("content") or [])
+                for i, b in enumerate(blocks):
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        blocks[i] = {**b, "text": b.get("text", "") + prov}
+                        patched = True
+                        break
+                final.append({**msg, "content": blocks})
+            else:
+                final.append(msg)
+        if not patched:
+            final.insert(0, {"role": "system", "content": [{"type": "text", "text": prov.strip()}]})
+        return final
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +545,8 @@ def construct_local_vlm_agent(
     top_p: float = 0.9,
     defense: Any = None,
     ecso: Any = None,
+    task_intent: Optional[str] = None,
+    payload_markers: Optional[List[str]] = None,
 ):
     """
     Builds and registers everything needed for one (model, task) run:
@@ -483,7 +585,8 @@ def construct_local_vlm_agent(
     prompt_constructor = LocalVLMPromptConstructor(instruction_path, lm_config=llm_config, tokenizer=tokenizer)
     backend = LocalVLMBackend(model, processor, extractor,
                               max_new_tokens=max_new_tokens, defense=defense,
-                              ecso=ecso)
+                              ecso=ecso, task_intent=task_intent,
+                              payload_markers=payload_markers)
 
     register_local_vlm_backend(model_id, backend)
     install_local_vlm_provider()

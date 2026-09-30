@@ -90,6 +90,11 @@ _PROJECTOR_PATHS = (
     "model.mlp1",
     "visual.merger",
     "model.visual.merger",
+    # Gemma 4 Unified (12B/31B): no separate vision tower; image patches
+    # are embedded straight into the text model's space by embed_vision
+    # (output 3840 = text hidden size). Read off a meta-device build of
+    # the real config (env audit S9, 30 Sep).
+    "model.embed_vision",
 )
 
 

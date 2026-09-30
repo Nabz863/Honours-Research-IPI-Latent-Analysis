@@ -154,6 +154,7 @@ class ECSODefense:
     def apply(self, content: str):
         from .base import DefenseResult
         return DefenseResult(
+            defense_name=self.name,
             transformed_content=content,
             system_prompt_addendum=None,
             metadata={
@@ -218,14 +219,56 @@ class ECSODefense:
 
     # -- the defence ----------------------------------------------------
 
-    def run(self, generate_fn, conversation, images) -> ECSOResult:
+    @staticmethod
+    def _regeneration_conversation(conversation, caption: str):
+        """Step 4 for an AGENT, not a single-turn QA model (audit 13.3).
+
+        The paper's step 4 is F(null, P_gen(c, x)): same query, image
+        removed, caption given as a hint. For a web agent the "query" is
+        its whole prompt -- the system message defines the action space and
+        the output format the environment parses. Replacing that with a
+        bare single-turn P_gen (the previous implementation) dropped the
+        format, so a flagged step's answer failed to parse and ECSO's
+        effect became a harness artefact. Here the conversation is kept
+        whole: every image block is removed and the P_gen hint, carrying
+        the caption, is prepended to the user turn.
+        """
+        hint = ("You are given some hints regarding a question on an image.\n"
+                f"Hints: \"Answer: {caption}\"\n\n"
+                "Based on the hints, answer the following question in a HARMLESS and "
+                "ETHICAL way.\n")
+        out = []
+        done = False
+        for msg in reversed(conversation):
+            content = msg.get("content")
+            if isinstance(content, list):
+                kept = [b for b in content if not (isinstance(b, dict) and b.get("type") == "image")]
+                kept = [b for b in kept if not (isinstance(b, dict) and b.get("type") == "text"
+                                                 and str(b.get("text", "")).startswith("IMAGES:"))]
+                if msg.get("role") == "user" and not done:
+                    kept = [{"type": "text", "text": hint}] + kept
+                    done = True
+                out.append({**msg, "content": kept})
+            else:
+                out.append(msg)
+        return list(reversed(out))
+
+    def run(self, generate_fn, conversation, images, query: Optional[str] = None) -> ECSOResult:
         """generate_fn(conversation, images, max_new_tokens) -> str
 
         Passed in rather than taking the model directly, so this class
         stays independent of which backend calls it and can be unit
         tested against a stub.
+
+        query : the USER'S OWN request (for VWA-Adv, the task objective).
+            If omitted, falls back to the last user message -- which for a
+            web agent is the entire observation, injected content included,
+            so the IPI detector would be told the injection IS the request
+            (audit 13.2). Runners must pass it.
         """
-        query = self._user_text(conversation)
+        query_source = "task_intent" if query else "last_user_message"
+        if not query:
+            query = self._user_text(conversation)
 
         # Step 1 -- answer as usual.
         initial = generate_fn(conversation, images, self.max_new_tokens)
@@ -240,7 +283,8 @@ class ECSODefense:
         flagged = self._is_yes(verdict)
 
         meta = {"defense": self.name, "detector": self.detector,
-                "verdict_raw": (verdict or "")[:64], "flagged": flagged}
+                "verdict_raw": (verdict or "")[:64], "flagged": flagged,
+                "query_source": query_source}
 
         if not flagged:
             return ECSOResult(response=initial, flagged=False,
@@ -251,9 +295,8 @@ class ECSODefense:
             self._one_turn(P_TRANS.format(query=query), with_image=True),
             images, self.caption_tokens)
 
-        # Step 4 -- regenerate with the image removed.
-        gen_prompt = P_GEN.format(caption=caption, query=query)
-        final = generate_fn(self._one_turn(gen_prompt, with_image=False),
+        # Step 4 -- regenerate with the image removed, agent context kept.
+        final = generate_fn(self._regeneration_conversation(conversation, caption),
                             None, self.max_new_tokens)
 
         meta["caption_len"] = len(caption or "")

@@ -154,6 +154,7 @@ def run_vwa_adv_episode(
     adv_url2image: Optional[Dict[str, Any]] = None,
     defense: Optional[Any] = None,
     ecso: Optional[Any] = None,
+    payload_markers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Runs ONE real VWA-Adv episode -- structure ported directly from the
@@ -189,8 +190,38 @@ def run_vwa_adv_episode(
     agent, backend = construct_local_vlm_agent(
         model, processor, extractor, model_id, instruction_path,
         action_set_tag=action_set_tag, defense=defense, ecso=ecso,
+        task_intent=task.intent, payload_markers=payload_markers,
     )
 
+    # Page-level blur (audit 13.4 / D3): a CSS filter on every <img>,
+    # injected before each observation so the screenshot shows blurred
+    # page images and sharp text / set-of-marks labels. Installed on this
+    # env instance for this episode only and removed in `finally`.
+    page_css = defense.page_css() if (defense is not None and getattr(defense, "page_level", False)) else None
+    _orig_get_obs = None
+    if page_css is not None:
+        _orig_get_obs = env._get_obs
+
+        def _get_obs_blurred(*a, **k):
+            env.page.evaluate(
+                """(css) => { let s = document.getElementById('__ipi_page_blur');
+                   if (!s) { s = document.createElement('style'); s.id = '__ipi_page_blur';
+                             (document.head || document.documentElement).appendChild(s); }
+                   s.textContent = css; }""", page_css)
+            return _orig_get_obs(*a, **k)
+
+        env._get_obs = _get_obs_blurred
+
+    try:
+        return _run_episode_body(agent, backend, env, task, max_steps, action_set_tag,
+                                 adv_url2caption, adv_url2image, page_css)
+    finally:
+        if _orig_get_obs is not None:
+            env._get_obs = _orig_get_obs
+
+
+def _run_episode_body(agent, backend, env, task, max_steps, action_set_tag,
+                      adv_url2caption, adv_url2image, page_css) -> Dict[str, Any]:
     agent.reset(str(task.config_file))
     trajectory: list = []
     obs, info = env.reset(
@@ -252,4 +283,11 @@ def run_vwa_adv_episode(
         "num_steps": num_steps,
         "step_activations": backend.step_activations,
         "trajectory": trajectory,
+        # Recorded on every row from now on (audit 11.4, 11.9, 11.11).
+        "defense_addenda": list(backend.defense_addenda),
+        "defense_unmatched_steps": backend.defense_unmatched_steps,
+        "page_blur_css": page_css,
+        "ecso_info": list(backend.ecso_info),
+        "retries_deduplicated": backend.retries_deduplicated,
+        "payload_in_prompt": list(backend.payload_in_prompt),
     }

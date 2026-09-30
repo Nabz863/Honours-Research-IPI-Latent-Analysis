@@ -199,6 +199,143 @@ def _parse_model_output(completion: str) -> tuple[str, List[FunctionCall]]:
     return last_text.strip(), [last_valid]
 
 
+_GEMMA_Q = '<|"|>'
+_GEMMA_OPEN = "<|tool_call>call:"
+_GEMMA_CLOSE = "<tool_call|>"
+
+
+def _parse_gemma_native(raw: str) -> Optional["FunctionCall"]:
+    """Parses Gemma 4's native tool call from a decode that KEPT special
+    tokens:  <|tool_call>call:NAME{key:<|"|>text, with commas<|"|>,n:3,
+    xs:[<|"|>a<|"|>,<|"|>b<|"|>]}<tool_call|>
+
+    Format read from the model's own chat template (format_argument):
+    strings wrapped in the special token <|"|>, numbers and booleans bare,
+    lists in [...], objects in {...}. Returns the LAST complete call, or
+    None if there is none -- the caller then falls back to the other
+    parsers. Values are typed as the template wrote them: a quoted string
+    stays a string, so a date is never coerced, while an unquoted 3 is 3.
+    """
+    start = raw.rfind(_GEMMA_OPEN)
+    if start == -1:
+        return None
+    s = raw[start + len(_GEMMA_OPEN):]
+    end = s.find(_GEMMA_CLOSE)
+    if end != -1:
+        s = s[:end]
+    brace = s.find("{")
+    if brace == -1:
+        return None
+    name = s[:brace].strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return None
+    pos = [brace]
+
+    def peek():
+        return s[pos[0]] if pos[0] < len(s) else ""
+
+    def skip_ws():
+        while pos[0] < len(s) and s[pos[0]].isspace():
+            pos[0] += 1
+
+    def parse_string():
+        pos[0] += len(_GEMMA_Q)
+        j = s.find(_GEMMA_Q, pos[0])
+        if j == -1:
+            raise ValueError("unterminated string")
+        out = s[pos[0]:j]
+        pos[0] = j + len(_GEMMA_Q)
+        return out
+
+    def parse_bare():
+        j = pos[0]
+        while j < len(s) and s[j] not in ",}]":
+            j += 1
+        tok = s[pos[0]:j].strip()
+        pos[0] = j
+        low = tok.lower()
+        if low in ("true", "false"):
+            return low == "true"
+        if low in ("null", "none"):
+            return None
+        try:
+            return int(tok)
+        except ValueError:
+            pass
+        try:
+            return float(tok)
+        except ValueError:
+            return tok
+
+    def parse_value():
+        skip_ws()
+        if s.startswith(_GEMMA_Q, pos[0]):
+            return parse_string()
+        c = peek()
+        if c == "{":
+            return parse_object()
+        if c == "[":
+            return parse_list()
+        return parse_bare()
+
+    def parse_key():
+        skip_ws()
+        if s.startswith(_GEMMA_Q, pos[0]):
+            k = parse_string()
+        else:
+            j = s.find(":", pos[0])
+            if j == -1:
+                raise ValueError("key without ':'")
+            k = s[pos[0]:j].strip().strip('"\'')
+            pos[0] = j
+        skip_ws()
+        if peek() != ":":
+            raise ValueError("expected ':'")
+        pos[0] += 1
+        return k
+
+    def parse_object():
+        pos[0] += 1  # '{'
+        out = {}
+        skip_ws()
+        if peek() == "}":
+            pos[0] += 1
+            return out
+        while True:
+            k = parse_key()
+            out[k] = parse_value()
+            skip_ws()
+            c = peek()
+            pos[0] += 1
+            if c == "}":
+                return out
+            if c != ",":
+                raise ValueError(f"expected ',' or '}}', got {c!r}")
+
+    def parse_list():
+        pos[0] += 1  # '['
+        out = []
+        skip_ws()
+        if peek() == "]":
+            pos[0] += 1
+            return out
+        while True:
+            out.append(parse_value())
+            skip_ws()
+            c = peek()
+            pos[0] += 1
+            if c == "]":
+                return out
+            if c != ",":
+                raise ValueError(f"expected ',' or ']', got {c!r}")
+
+    try:
+        args = parse_object()
+    except (ValueError, IndexError):
+        return None
+    return FunctionCall(function=name, args=args)
+
+
 _GEMMA_CALL = re.compile(r"call\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{([^{}]*)\}")
 
 
@@ -236,10 +373,23 @@ def _parse_gemma_call(completion):
                 continue
             k, v = part.split(":", 1)
             k, v = k.strip(), v.strip()
+            # Gemma quotes its KEYS as often as its values:
+            #     call:get_day_calendar_events{"day":"2024-05-15"}
+            # Stripping only the value leaves the key as the literal
+            # string '"day"', so the tool is invoked with an unexpected
+            # keyword, the call errors, and the episode ends after two
+            # turns. Measured: 240 of 629 episodes terminated that way,
+            # and every one of 144 sampled tasks showed a zero
+            # activation delta because no second tool result was ever
+            # retrieved.
+            for _q in ("'", '"'):
+                if len(k) >= 2 and k[0] == k[-1] == _q:
+                    k = k[1:-1]
+                if len(v) >= 2 and v[0] == v[-1] == _q:
+                    v = v[1:-1]
+            k, v = k.strip(), v.strip()
             if not k:
                 continue
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-                v = v[1:-1]
             args[k] = v
     return FunctionCall(function=name, args=args)
 
@@ -420,6 +570,12 @@ class LocalVLMPipelineElement(BasePipelineElement):
         extra_args: Optional[Dict[str, Any]] = None,
     ):
         messages = list(messages)
+        # The pipeline's own history. The defence is applied to a COPY for
+        # this turn's prompt only; the undefended history is what gets
+        # returned. Returning the defended copy (the previous behaviour)
+        # made every later turn re-defend already-defended text: base64 of
+        # base64, delimiters inside delimiters (audit 11.1).
+        history = list(messages)
         extra_args = dict(extra_args) if extra_args else {}
         tools = list(runtime.functions.values()) if runtime is not None else []
 
@@ -517,7 +673,16 @@ class LocalVLMPipelineElement(BasePipelineElement):
         completion = self.processor.decode(output_ids[0][input_length:], skip_special_tokens=True).strip()
         self.turn_raw_completions.append(completion)
 
-        text_content, tool_calls = _parse_model_output(completion)
+        # Gemma 4 delimits string arguments with the SPECIAL token <|"|>,
+        # which skip_special_tokens=True strips -- leaving unquoted values
+        # the fallback parser has to guess at (audit 11.15). Parse its
+        # native call from a decode that keeps special tokens.
+        raw_with_special = self.processor.decode(output_ids[0][input_length:], skip_special_tokens=False)
+        native = _parse_gemma_native(raw_with_special)
+        if native is not None:
+            text_content, tool_calls = completion, [native]
+        else:
+            text_content, tool_calls = _parse_model_output(completion)
         self.turn_tool_calls.append([_summarize_tool_call(fc) for fc in tool_calls])
 
         assistant_message = {
@@ -525,8 +690,7 @@ class LocalVLMPipelineElement(BasePipelineElement):
             "content": [{"content": text_content}],
             "tool_calls": tool_calls if tool_calls else None,
         }
-        messages = [*messages, assistant_message]
-        return query, runtime, env, messages, extra_args
+        return query, runtime, env, [*history, assistant_message], extra_args
 
 
 def _summarize_tool_call(fc: FunctionCall, max_str_len: int = 200) -> Dict[str, Any]:

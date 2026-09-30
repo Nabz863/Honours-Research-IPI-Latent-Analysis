@@ -103,9 +103,32 @@ class GaussianBlurDefense:
     failure loud rather than silent.
     """
 
+    # PAGE-LEVEL (audit 13.4, decision D3, 30 Sep): the blur is applied to
+    # the page's IMAGES -- in the browser before each screenshot (CSS
+    # filter, sigma in rendered pixels) and to every image the
+    # self-captioner reads -- never to the whole screenshot, whose text and
+    # set-of-marks labels the agent needs to act. The backend skips
+    # apply_image() for page-level defences; the runner calls page_css()
+    # and blur_pil() instead.
+    page_level = True
+
     def __init__(self, sigma: float = 1.5, announce: bool = False):
         self.sigma = float(sigma)
         self.announce = bool(announce)
+
+    def page_css(self) -> str:
+        """CSS applied to every <img> before each observation. CSS
+        blur(r) takes r as the Gaussian's standard deviation in CSS
+        pixels, i.e. sigma at the size the page renders the image."""
+        return f"img {{ filter: blur({self.sigma:g}px) !important; }}"
+
+    def blur_pil(self, image):
+        """The same blur for an image the captioner reads. The victim
+        images are served at the size the page renders them (A1: stored
+        size == rendered box), so sigma means the same thing in both
+        places."""
+        from PIL import ImageFilter
+        return image.filter(ImageFilter.GaussianBlur(radius=self.sigma))
 
     @property
     def name(self) -> str:
@@ -116,6 +139,7 @@ class GaussianBlurDefense:
     def apply(self, content: str):
         from .base import DefenseResult
         return DefenseResult(
+            defense_name=self.name,
             transformed_content=content,
             system_prompt_addendum=None,
             metadata={
