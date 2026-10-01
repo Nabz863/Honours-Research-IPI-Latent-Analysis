@@ -42,7 +42,10 @@ class ShippedImageAttack(BaseAttack):
         adv_dir = Path(adv_dir)
         img_path = adv_dir / f"{self.prefix}_attack_image.png"
         if not img_path.exists():
-            raise FileNotFoundError(f"{img_path} not shipped for this task")
+            # "not shipped" is a per-task data condition, recognised by the
+            # runner as benign so a run of missing files cannot trip its
+            # consecutive-failure abort (review 3, #8).
+            raise FileNotFoundError(f"transfer image not shipped for this task: {img_path}")
         img = Image.open(img_path).convert("RGB")
         cap_path = adv_dir / f"{self.prefix}_attack_caption.txt"
         paper_caption = cap_path.read_text().strip() if cap_path.exists() else None

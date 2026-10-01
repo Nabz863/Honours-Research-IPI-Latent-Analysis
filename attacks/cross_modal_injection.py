@@ -231,15 +231,25 @@ class CrossModalInjectionAttack(BaseAttack):
         target_embed = self._target_text_embedding(
             target_behavior, device, next(self.model.parameters()).dtype
         )
-        captured: Dict[str, torch.Tensor] = {}
+        captured: Dict[str, Any] = {}
 
         def _hook(module, inp, out):
             # NOT detached -- the VLA gradient must reach delta through this.
-            captured["v"] = out[0] if isinstance(out, tuple) else out
+            # Only an output WITH a gradient path is kept: some projectors
+            # (Gemma's embed_vision) are also called on vision-token ids,
+            # whose output has no path to delta; keeping that call would
+            # make the alignment term silently inert (review 3, #9).
+            t = out[0] if isinstance(out, tuple) else out
+            if torch.is_tensor(t) and t.requires_grad:
+                captured["v"] = t
+                captured["n_grad"] = captured.get("n_grad", 0) + 1
+            else:
+                captured["n_nograd"] = captured.get("n_nograd", 0) + 1
 
         handle = projector.register_forward_hook(_hook)
 
         vla_start = vla_end = ce_end = None
+        proj_calls = None
         try:
             for step in range(self.iters):
                 adv = (clean + delta).clamp(0, 1)
@@ -257,9 +267,12 @@ class CrossModalInjectionAttack(BaseAttack):
                 v = captured.get("v")
                 if v is None:
                     raise RuntimeError(
-                        f"Projector hook at {projector_path!r} never fired -- VLA would be "
+                        f"Projector hook at {projector_path!r} produced no output with a gradient "
+                        f"path ({captured.get('n_nograd', 0)} call(s) without one) -- VLA would be "
                         "silently inert. Fix the projector path before trusting any result."
                     )
+                if step == 0:
+                    proj_calls = (captured.get("n_grad", 0), captured.get("n_nograd", 0))
                 v_mean = v.reshape(-1, v.shape[-1]).mean(dim=0)
                 vla_loss = 1.0 - F.cosine_similarity(
                     v_mean.unsqueeze(0).float(), target_embed.unsqueeze(0).float()
@@ -296,6 +309,8 @@ class CrossModalInjectionAttack(BaseAttack):
             metadata={
                 "vla_weight": self.vla_weight,
                 "projector_path": projector_path,
+                # (calls with a gradient path, calls without) at step 0.
+                "projector_calls_grad_nograd": proj_calls,
                 # If vla_loss_end is not below vla_loss_start, VLA did not
                 # actually optimise anything and the result is not CrossInject.
                 "vla_loss_start": vla_start,

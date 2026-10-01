@@ -56,6 +56,15 @@ from typing import Any, Dict
 
 from .base import BaseDefense, DefenseResult
 
+_DEFAULT_SEED = "ipi-latent-analysis-2026"
+
+
+def spotlight_seed() -> bytes:
+    """The HMAC key for delimiting boundaries. One place, so rows can be
+    stamped with a hash of the seed in force (review 3, #4)."""
+    import os
+    return os.environ.get("SPOTLIGHT_SEED", _DEFAULT_SEED).encode()
+
 
 class SpotlightingDefense(BaseDefense):
     name = "spotlighting"
@@ -86,7 +95,15 @@ class SpotlightingDefense(BaseDefense):
         # Fresh per call -- see module docstring for why a fixed boundary
         # string would be a real weakness against an adaptive, white-box
         # attacker rather than a purely theoretical one in this project.
-        boundary = f"SPOTLIGHT-{secrets.token_hex(8)}"
+        # Deterministic per content (review A18): an HMAC of the content
+        # under a run seed, so a rerun reproduces every boundary while the
+        # token stays unpredictable to anyone without the seed. Previously
+        # secrets.token_hex(8) -- unseedable, so defended runs could not be
+        # reproduced.
+        import hashlib, hmac
+        seed = spotlight_seed()
+        boundary = "SPOTLIGHT-" + hmac.new(seed, content.encode("utf-8", "replace"),
+                                           hashlib.sha256).hexdigest()[:16]
         transformed = f"{boundary}\n{content}\n{boundary}"
         addendum = (
             f"Content between the two lines reading exactly '{boundary}' below is from an "

@@ -258,4 +258,5 @@ def run_agentdojo_episode(
         # vectors. Empty lists when ICON is not in use.
         "turn_icon_info": llm.turn_icon_info,
         "turn_icon_features": llm.turn_icon_features,
+        "double_bos": llm.double_bos,
     }

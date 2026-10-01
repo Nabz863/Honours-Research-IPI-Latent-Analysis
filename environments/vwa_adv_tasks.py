@@ -199,22 +199,39 @@ def run_vwa_adv_episode(
     # env instance for this episode only and removed in `finally`.
     page_css = defense.page_css() if (defense is not None and getattr(defense, "page_level", False)) else None
     _orig_get_obs = None
+    css_failures = {"n": 0}
     if page_css is not None:
         _orig_get_obs = env._get_obs
-
-        def _get_obs_blurred(*a, **k):
-            env.page.evaluate(
-                """(css) => { let s = document.getElementById('__ipi_page_blur');
+        _js = """(css) => { let s = document.getElementById('__ipi_page_blur');
                    if (!s) { s = document.createElement('style'); s.id = '__ipi_page_blur';
                              (document.head || document.documentElement).appendChild(s); }
-                   s.textContent = css; }""", page_css)
+                   s.textContent = css; }"""
+
+        def _get_obs_blurred(*a, **k):
+            # A navigation in flight can destroy the execution context;
+            # wait for the load and retry once, and count any failure
+            # rather than fail the episode (review C13).
+            for attempt in (0, 1):
+                try:
+                    env.page.evaluate(_js, page_css)
+                    break
+                except Exception:
+                    if attempt == 0:
+                        try:
+                            env.page.wait_for_load_state("load", timeout=10000)
+                        except Exception:
+                            pass
+                    else:
+                        css_failures["n"] += 1
             return _orig_get_obs(*a, **k)
 
         env._get_obs = _get_obs_blurred
 
     try:
-        return _run_episode_body(agent, backend, env, task, max_steps, action_set_tag,
-                                 adv_url2caption, adv_url2image, page_css)
+        out = _run_episode_body(agent, backend, env, task, max_steps, action_set_tag,
+                                adv_url2caption, adv_url2image, page_css)
+        out["blur_css_failures"] = css_failures["n"]
+        return out
     finally:
         if _orig_get_obs is not None:
             env._get_obs = _orig_get_obs
@@ -270,24 +287,40 @@ def _run_episode_body(agent, backend, env, task, max_steps, action_set_tag,
             trajectory.append(create_stop_action(""))
             break
 
-    evaluator = evaluator_router(task.config_file, captioning_fn=None)
-    score = evaluator(
-        trajectory=trajectory,
-        config_file=str(task.config_file),
-        page=env.page,
-        client=env.get_page_client(env.page),
-    )
+    # The page the agent ENDED on. Evaluators may navigate (program_html
+    # checks visit their own URLs), so every later evaluation restores this
+    # first (review A7).
+    final_url = env.page.url
+    # An evaluator exception used to discard the whole episode, activations
+    # included (review 3, #15). It is now recorded and ASR left unscored.
+    asr_scoring_error = None
+    try:
+        evaluator = evaluator_router(task.config_file, captioning_fn=None)
+        score = evaluator(
+            trajectory=trajectory,
+            config_file=str(task.config_file),
+            page=env.page,
+            client=env.get_page_client(env.page),
+        )
+        success = bool(score)
+    except Exception as e:
+        success = None
+        asr_scoring_error = f"{type(e).__name__}: {str(e)[:160]}"
 
     return {
-        "success": bool(score),
+        "success": success,
+        "asr_scoring_error": asr_scoring_error,
         "num_steps": num_steps,
         "step_activations": backend.step_activations,
         "trajectory": trajectory,
         # Recorded on every row from now on (audit 11.4, 11.9, 11.11).
         "defense_addenda": list(backend.defense_addenda),
         "defense_unmatched_steps": backend.defense_unmatched_steps,
+        "prev_action_defended": backend.prev_action_defended,
         "page_blur_css": page_css,
         "ecso_info": list(backend.ecso_info),
         "retries_deduplicated": backend.retries_deduplicated,
         "payload_in_prompt": list(backend.payload_in_prompt),
+        "final_url": final_url,
+        "double_bos": backend.double_bos,
     }

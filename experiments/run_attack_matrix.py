@@ -148,226 +148,12 @@ def _require_gpu_if_hpc(model, hpc: bool) -> None:
         )
 
 
-@contextlib.contextmanager
-def _cuda_memory_guard():
-    """
-    Wraps ONE episode's execution: resets peak memory stats before,
-    exposes a dict the caller reads peak_gb from after the `with` block,
-    and unconditionally empty_cache()s + gc.collect()s afterward --
-    belt-and-suspenders on top of LocalVLMPipelineElement's own per-TURN
-    cleanup, targeting any cross-EPISODE accumulation (agentdojo's own
-    pipeline/environment objects, or Python reference cycles that plain
-    refcounting doesn't collect -- gc.collect() specifically exists for
-    that) that per-turn cleanup wouldn't reach.
-
-    Real motivation, not preemptive: job 23527 hit a genuine CUDA OOM
-    roughly 40 episodes into a 629-task run, inside an attention softmax
-    call (21.87 GiB in use on a 24GB card before a 2.36 GiB allocation
-    failed). Two honest explanations are both physically plausible --
-    memory accumulating across episodes that per-turn cleanup doesn't
-    fully reach, OR that specific task's conversation simply being long
-    enough to legitimately need that much -- and there wasn't enough
-    data to tell which. peak_cuda_memory_gb (logged per row below) is
-    what actually answers that on the next run, rather than guessing.
-    """
-    stats: Dict[str, Optional[float]] = {"peak_gb": None}
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    try:
-        yield stats
-    finally:
-        if torch.cuda.is_available():
-            try:
-                stats["peak_gb"] = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                torch.cuda.empty_cache()
-            except Exception as cleanup_error:
-                # A poisoned CUDA context (e.g. after a device-side assert)
-                # can make even cleanup calls raise -- letting that REPLACE
-                # whatever real exception was already propagating is exactly
-                # backwards. Confirmed directly on a real run: empty_cache()
-                # here raised its own AcceleratorError, masking the actual
-                # device-side-assert traceback underneath a confusing second
-                # one. Log and swallow the cleanup failure instead.
-                logger.warning(
-                    "Cleanup inside _cuda_memory_guard failed (%s: %s) -- swallowing so it "
-                    "doesn't mask whatever exception triggered this finally block.",
-                    type(cleanup_error).__name__, cleanup_error,
-                )
-        gc.collect()
-
-
-# Failures that are terminal for the PROCESS, not for one task. After any of
-# these, every subsequent episode in this process fails identically, so
-# recording a row and continuing wastes the rest of the allocation.
-#
-# Two families:
-#
-#   Playwright/browser -- the browser env is constructed once and shared by
-#   every episode. Job 61500's launch timed out on episode 0 and the run
-#   spent 25h46m recording 599 further failures against a dead browser. The
-#   "asyncio loop" message is the tell: a browser failure leaves Playwright's
-#   event loop marked running, and every later sync_playwright() refuses.
-#   These cannot fire during an AgentDojo run -- it uses no browser.
-#
-#   CUDA context corruption -- distinct from OutOfMemoryError, which IS
-#   per-task and recoverable (that is what the OOM branch below is for).
-#   An illegal access or a device-side assert leaves the context unusable, so
-#   every later forward pass fails whatever the task.
-_PROCESS_FATAL_MARKERS = (
-    "asyncio loop",
-    "BrowserType.launch",
-    "Target page, context or browser has been closed",
-    "browser has been closed",
-    "Connection closed",
-    "Target crashed",
-    "CUDA error: unspecified launch failure",
-    "CUDA error: illegal memory access",
-    "device-side assert triggered",
+# Shared with the VWA runner; moved to experiments/episode_utils.py (review 4,
+# M3) and re-exported here so existing imports keep working.
+from experiments.episode_utils import (  # noqa: E402
+    _cuda_memory_guard, _PROCESS_FATAL_MARKERS, _ensure_inference_state, _run_episode_safely,
+    _build_defense_registry, atomic_write_json, atomic_torch_save,
 )
-
-
-def _ensure_inference_state(model) -> list:
-    """
-    Put a model back into inference state. Returns what had to change.
-
-    Needed because the pixel-space attacks (adversarial_patch,
-    pixel_perturbation, cross_modal_injection) call model.train() and
-    gradient_checkpointing_enable() to backpropagate into the image, and do
-    not restore either. Left that way, HuggingFace disables the KV cache and
-    the numerical path of every later episode changes -- see audit entry 8:
-    37 of 40 clean-defended episodes differed between two runs of the same
-    condition.
-
-    An empty return means the model was already in inference state.
-    """
-    changed = []
-    if getattr(model, "is_gradient_checkpointing", False) and \
-            hasattr(model, "gradient_checkpointing_disable"):
-        model.gradient_checkpointing_disable()
-        changed.append("gradient_checkpointing")
-    if getattr(model, "training", False):
-        model.eval()
-        changed.append("train_mode")
-    for cfg in (getattr(model, "config", None),
-                getattr(getattr(model, "config", None), "text_config", None)):
-        if cfg is not None and getattr(cfg, "use_cache", True) is False:
-            cfg.use_cache = True
-            changed.append("use_cache")
-    return changed
-
-
-def _run_episode_safely(fn: Callable, *args, **kwargs) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Wraps a run_agentdojo_episode() call, catching BOTH
-    torch.OutOfMemoryError AND every other exception (see the second except
-    clause below), so ONE pathological task can't take down the entire run.
-
-    WARNING -- this converts ANY failure into a recorded row, including a
-    failure that is terminal for the whole process rather than for one task.
-    Job 61500's browser launch timed out on episode 0; this function
-    recorded it and returned; the run then spent 25h46m recording 599
-    further failures against a dead shared browser and exited COMPLETED 0:0.
-
-    PROCESS-FATAL failures are handled HERE. An error matching
-    _PROCESS_FATAL_MARKERS raises SystemExit instead of returning a row, so
-    every caller inherits that protection -- run_vwa_adv_matrix.py and all
-    four call sites in this file included. SystemExit is a BaseException and
-    so passes through `except Exception` untouched.
-
-    PER-TASK failure ACCUMULATION stays the caller's job, because only the
-    caller knows which errors are legitimate for a single task.
-    run_vwa_adv_curated_matrix has a 25-consecutive-failure backstop in its
-    record(), with exemptions for its own benign per-task errors (no victim
-    image, no clean reference activation, no cached payload). Other callers
-    have no equivalent.
-
-    On the OOM case: this is not
-    a hypothetical: job 23613 was a completely FRESH process (model just
-    loaded, zero real episodes executed -- 78 prior results were all
-    skip-logic, no GPU work at all) and OOM'd on the very FIRST real
-    episode it attempted, immediately after the skips. That's decisive:
-    it rules out cross-episode accumulation (the earlier
-    _cuda_memory_guard fix's target) and confirms this is ONE task's
-    prompt being long enough to exceed available memory on its own, from
-    a cold start, every time. Without this fix, resubmitting achieves
-    NOTHING -- every fresh process reaches the same task and dies the
-    same way, forever, regardless of how many times it's resubmitted.
-
-    Returns (result, error) -- error is None on success, or a short
-    description on failure, in which case result is a placeholder dict
-    (asr_success/utility_success=None, empty turn_activations) so every
-    call site's row-building code works unmodified whether the episode
-    succeeded or not, rather than needing per-site special-casing.
-    """
-    # Every episode starts from a known inference state, whatever ran before
-    # it in this process. The warning is the evidence: it fires only when an
-    # earlier step (an attack's generate()) left the model in the wrong state.
-    for _a in list(args) + list(kwargs.values()):
-        if isinstance(_a, torch.nn.Module):
-            _changed = _ensure_inference_state(_a)
-            if _changed:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "restored inference state before episode (was: %s) -- "
-                    "an earlier step left the model out of eval mode; see "
-                    "audit entry 8", ", ".join(_changed))
-    try:
-        return fn(*args, **kwargs), None
-    except torch.OutOfMemoryError as e:
-        torch.cuda.empty_cache()
-        gc.collect()
-        return (
-            {
-                "asr_success": None,
-                "utility_success": None,
-                "turn_activations": [],
-                "turn_tool_calls": [],
-                "turn_raw_completions": [],
-            },
-            f"CUDA_OOM: {str(e).splitlines()[0][:200]}",
-        )
-    except Exception as e:
-        # The ROW keeps only the first line, to stay compact. The TRACEBACK
-        # goes to the log. Job 61500 needed a whole separate probe job to
-        # diagnose because only the first line survived, and the first line
-        # of a Playwright error says what broke but not where.
-        import traceback as _tb
-        import logging as _logging
-        _logging.getLogger(__name__).error(
-            "episode raised %s -- full traceback follows:\n%s",
-            type(e).__name__, _tb.format_exc())
-        gc.collect()
-
-        # Abort the whole run rather than record a row, when the failure is
-        # terminal for the process. SystemExit derives from BaseException, so
-        # it passes through callers' `except Exception` blocks untouched, and
-        # every caller writes its results file incrementally -- so nothing
-        # recorded so far is lost, and the failing episode is simply absent
-        # rather than present-but-empty, which means a resubmit retries it.
-        _msg = f"{type(e).__name__}: {e}"
-        for _m in _PROCESS_FATAL_MARKERS:
-            if _m in _msg:
-                _logging.getLogger(__name__).error(
-                    "ABORTING RUN: %r is terminal for this process, not for "
-                    "one task. Every remaining episode would fail the same "
-                    "way. Fix the cause and resubmit -- rows carrying an "
-                    "error are not treated as done.", _m)
-                raise SystemExit(
-                    f"ABORT: process-fatal failure (matched {_m!r})\n"
-                    f"  {_msg.splitlines()[0][:300]}\n"
-                    f"  Every remaining episode would fail identically. "
-                    f"Resubmit after fixing the cause; incomplete rows are "
-                    f"retried automatically.")
-        return (
-            {
-                "asr_success": None,
-                "utility_success": None,
-                "turn_activations": [],
-                "turn_tool_calls": [],
-                "turn_raw_completions": [],
-            },
-            f"{type(e).__name__}: {str(e).splitlines()[0][:200]}",
-        )
 
 
 def _wandb_init_if_requested(use_wandb: bool, project: str, run_name: Optional[str], config: Dict[str, Any]):
@@ -475,8 +261,12 @@ def _measure_circuit_breaker(
 
 
 def _build_attack_registry(model, processor) -> Dict[str, BaseAttack]:
+    from attacks.important_instructions import ImportantInstructionsAttack
     return {
         "template_ipi": TemplateIPIAttack(),
+        # AgentDojo's own standard attack, for comparability with published
+        # AgentDojo numbers (review B24; decision 30 Sep).
+        "important_instructions": ImportantInstructionsAttack(),
         "gcg": GCGAttack(model, processor),
         # Visual -- needs a real image, nothing to attack in AgentDojo's
         # text-only suites. Registered here for whenever VWA-Adv gets its
@@ -487,21 +277,6 @@ def _build_attack_registry(model, processor) -> Dict[str, BaseAttack]:
         # AgentDojo's suites are text-only. Registering them would let a
         # --attack_names typo produce a confusing runtime failure deep in
         # an episode instead of an immediate, clear KeyError.
-    }
-
-
-def _build_defense_registry() -> Dict[str, "BaseDefense"]:
-    """
-    Named per-variant, not one generic "spotlighting" entry -- the three
-    variants (delimiting/datamarking/encoding) have meaningfully
-    different robustness/utility profiles per Hines et al. 2024, worth
-    comparing separately rather than picking one and reporting it as
-    "spotlighting" broadly.
-    """
-    return {
-        "spotlighting_delimiting": SpotlightingDefense(variant="delimiting"),
-        "spotlighting_datamarking": SpotlightingDefense(variant="datamarking"),
-        "spotlighting_encoding": SpotlightingDefense(variant="encoding"),
     }
 
 
@@ -761,14 +536,17 @@ def run_agentdojo_attack_matrix(
     logger.info("AgentDojo benchmark_version=%s, system message from %s",
                 benchmark_version, SYSTEM_MESSAGE_SOURCE)
 
-    def _splice(adv_text: str, clean_text: str, defaults: Dict[str, str], vectors: List[str]) -> Dict[str, str]:
+    def _splice(adv_text: str, clean_text: str, defaults: Dict[str, str], vectors: List[str],
+                replace: bool = False) -> Dict[str, str]:
         """One payload into EVERY vector the task reads, each keeping its
         own default text. The attack generated `adv_text` from vector 0's
         default; the payload proper is whatever it appended, which is then
-        appended to each vector's own default. An attack whose output does
-        not start with the clean text replaces each vector outright, as
-        AgentDojo's own attacks do."""
-        if adv_text.startswith(clean_text):
+        appended to each vector's own default. An attack that REPLACES the
+        vector's content (metadata replaces_vector_content, e.g. AgentDojo's
+        important_instructions) replaces each vector outright, as AgentDojo
+        does -- decided by the flag, not by startswith(), which is always
+        true when vector 0's default is empty (review 3, #11)."""
+        if not replace and adv_text.startswith(clean_text):
             tail = adv_text[len(clean_text):]
             return {v: defaults[v] + tail for v in vectors}
         return {v: adv_text for v in vectors}
@@ -784,6 +562,13 @@ def run_agentdojo_attack_matrix(
         })
         _persist()
     tasks_with_injection = [t for t in tasks if t.injection_task_id is not None]
+    _task_by_id = {t.task_id: t for t in tasks}
+    if not tasks_with_injection:
+        # get_suites() of a misspelt version, or a --suite_names typo, gives
+        # an empty task list; a run of zero episodes must not "complete"
+        # (review 3, #4).
+        raise SystemExit(f"FATAL: no AgentDojo tasks loaded (benchmark_version={benchmark_version!r}, "
+                         f"suite_names={suite_names})")
 
     if max_tasks_per_suite is not None:
         # Cap PER SUITE, not the combined list -- otherwise, since suites
@@ -810,13 +595,9 @@ def run_agentdojo_attack_matrix(
         logger.info("  %s: %d tasks", suite_name, n)
 
     results_log: List[Dict[str, Any]] = []
+    # task_id -> {layer: tensor}, one clean turn per task, filled lazily
+    # from clean_<task_id>.pt by _clean_ref() below (review 3, #2).
     clean_activations_by_task: Dict[str, Dict[int, torch.Tensor]] = {}
-    # Only actually written to during the clean pass, never touched again --
-    # re-saving it on every _persist() call for the rest of the run (attack/
-    # defense loops) is pure waste, and is exactly what caused the earlier
-    # 109GB-cache, minutes-per-episode-persist problem. Track whether it's
-    # actually changed since the last save; only pay the write cost when true.
-    _clean_cache_dirty = False
     # (attack_name, task_id) -> (vector_id, adversarial_text) -- populated
     # below, reused by the defense loop so defended episodes test the
     # SAME payload the plain attack pass already produced, rather than
@@ -855,10 +636,62 @@ def run_agentdojo_attack_matrix(
     adv_payloads_path = output_dir / "adv_payloads_cache.json"
     clean_activations_path = output_dir / "clean_activations_cache.pt"
 
+    from experiments.code_version import (code_version, check_resume_compatible, attack_code_sha,
+                                          file_sha, model_identity, spotlight_seed_sha, write_manifest,
+                                          package_version, package_sha)
+    _CV = code_version()
+    logger.info("code version: commit=%s dirty=%s harness=%s attacks=%s",
+                _CV["commit"], _CV["dirty"], _CV["harness_sha256"][:12], _CV["attacks_sha256"][:12])
+    # Per-attack code hashes, run settings and defence configuration,
+    # stamped on rows and checked on resume (review 3, #3, #4, #13).
+    obf_layer = obfuscation_target_layer if obfuscation_target_layer is not None else target_layers[0]
+    _obf_settings = {"target_layer": obf_layer, "geometry_weight": obfuscation_geometry_weight,
+                     "num_steps": obfuscation_num_steps,
+                     "candidates_per_step": obfuscation_candidates_per_step,
+                     "clean_turn": obfuscation_clean_turn}
+    _ATK_SHA = {n: (attack_code_sha(ObfuscatedActivationAttack, _obf_settings)
+                    if n == "obfuscated_activation" else attack_code_sha(registry[n]))
+                for n in attack_names}
+    _MODEL_ID = model_identity(model)
+    # The installed agentdojo package supplies the tasks, environments,
+    # injection placement, system message and the important_instructions
+    # template, so its version is a run setting (review 4, M4).
+    _RUN_SETTINGS = {"model_id": _MODEL_ID, "benchmark_version": benchmark_version,
+                     "system_message_source": SYSTEM_MESSAGE_SOURCE,
+                     "agentdojo_version": package_version("agentdojo"),
+                     # code AND task data: catches an editable install with
+                     # local changes, which the version string does not
+                     # (review 5, M5)
+                     "agentdojo_package_sha": package_sha("agentdojo")}
+    _icon_prober_path = f"defenses/icon_prober_{Path(output_dir).name.split('_')[-1]}.pt"
+    _DEF_SHA: Dict[str, Optional[str]] = {}
+    for _d in (defense_names or []):
+        if _d.startswith("spotlighting"):
+            _DEF_SHA[_d] = spotlight_seed_sha()
+        elif _d == "icon":
+            _DEF_SHA[_d] = file_sha(_icon_prober_path) or (
+                "oracle" if os.environ.get("ICON_ORACLE_ATTACKED") == "1" else None)
+    _override = None
     if results_log_path.exists():
         with open(results_log_path) as f:
             results_log = json.load(f)
+        # Circuit-breaker / TaskTracker columns are fitted from episodes run
+        # in THIS process, so on a resume or a split run they would be fitted
+        # from a different sample (or not at all) for different rows of the
+        # same column (review 4, M2). Compute them post hoc from the .pt
+        # files instead.
+        if (enable_task_tracker or enable_circuit_breaker_measurement) and results_log:
+            raise SystemExit(
+                "FATAL: --enable_task_tracker / --enable_circuit_breaker_measurement cannot be "
+                "used on a resumed or split run (the fit would differ between rows). Compute "
+                "them post hoc from the saved activations.")
         logger.info("Resumed %d already-completed results from %s", len(results_log), results_log_path)
+        # Refuse to mix code states or run settings in one directory
+        # (review C9; review 3 #4, #13).
+        _override = check_resume_compatible(
+            results_log, _CV, set(attack_names), attack_shas=_ATK_SHA,
+            run_settings=_RUN_SETTINGS, defense_shas=_DEF_SHA, output_dir=output_dir)
+    write_manifest(output_dir)
     results_index: Dict[str, int] = {r["sample_id"]: i for i, r in enumerate(results_log)}
 
     def _is_complete(sample_id: str) -> bool:
@@ -890,8 +723,24 @@ def run_agentdojo_attack_matrix(
         failed episode) -- never silently drops a freshly computed
         result the way the old done_sample_ids-gated append did.
         """
-        from experiments.code_version import code_version as _cv
-        row.setdefault("code_version", _cv())
+        row.setdefault("code_version", _CV)
+        row.setdefault("benchmark_version", benchmark_version)
+        row.setdefault("run_settings", _RUN_SETTINGS)
+        if row.get("attack_name") in _ATK_SHA:
+            row.setdefault("attack_sha256", _ATK_SHA[row["attack_name"]])
+        if row.get("defense_name") in _DEF_SHA:
+            row.setdefault("defense_sha256", _DEF_SHA[row["defense_name"]])
+        if _override:
+            row.setdefault("resume_override", _override)
+        # Clean and defended-clean inputs depend only on the USER task, so
+        # the same episode recurs once per injection task (review A13).
+        # Analyses must de-duplicate on (user_task_id, condition, defence)
+        # for UA and for any probe split.
+        if "task_id" in row and "user_task_id" not in row:
+            _t = _task_by_id.get(row["task_id"])
+            if _t is not None:
+                row["user_task_id"] = _t.user_task_id
+                row["injection_task_id"] = _t.injection_task_id
         idx = results_index.get(sample_id)
         if idx is None:
             results_log.append(row)
@@ -899,7 +748,15 @@ def run_agentdojo_attack_matrix(
         else:
             results_log[idx] = row
 
+    # Stamps per payload: the attack's own code hash and the model. A
+    # payload of an attack in THIS run whose stamp differs is dropped (and
+    # regenerated); payloads of other attacks are carried through
+    # untouched, so a split run never loses the first run's payloads
+    # (review 3, #3).
+    adv_payload_stamps: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    adv_payload_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
     if adv_payloads_path.exists():
+        _stale = 0
         with open(adv_payloads_path) as f:
             for row in json.load(f):
                 # New format: the full injections dict. Old format (one
@@ -909,8 +766,16 @@ def run_agentdojo_attack_matrix(
                 inj = row.get("injections")
                 if inj is None:
                     inj = {row["vector_id"]: row["adversarial_text"]}
-                adv_payloads[(row["attack_name"], row["task_id"])] = inj
-        logger.info("Resumed %d cached adversarial payloads from %s", len(adv_payloads), adv_payloads_path)
+                key = (row["attack_name"], row["task_id"])
+                stamp = {"attack_sha256": row.get("attack_sha256"), "model_id": row.get("model_id")}
+                adv_payload_meta[key] = row.get("metadata") or {}
+                if key[0] in _ATK_SHA and stamp != {"attack_sha256": _ATK_SHA[key[0]], "model_id": _MODEL_ID}:
+                    _stale += 1
+                    continue
+                adv_payloads[key] = inj
+                adv_payload_stamps[key] = stamp
+        logger.info("Resumed %d cached adversarial payloads from %s (%d stale: other code or model, dropped)",
+                    len(adv_payloads), adv_payloads_path, _stale)
 
     # clean_activations_by_task is ONLY consumed by obfuscated_activation's
     # clean_reference_activation lookup -- if that attack isn't in this run,
@@ -918,39 +783,47 @@ def run_agentdojo_attack_matrix(
     # cause of a severe, worsening per-episode slowdown on a real run: a 109GB
     # cache, rewritten from scratch via torch.save() after EVERY episode, for a
     # run whose --attack_names never included obfuscated_activation at all.
-    needs_clean_cache = "obfuscated_activation" in attack_names
-    logger.info("needs_clean_cache=%s (obfuscated_activation %s in attack_names=%s)",
-                needs_clean_cache, "is" if needs_clean_cache else "is NOT", attack_names)
+    #
+    # REPLACED (review 3, #2): the cache file was written only when
+    # obfuscated_activation was in the run, so a split run -- gradient
+    # attacks in a second process -- found it empty and skipped every
+    # obfuscated cell. The reference now comes from the task's own
+    # clean_<task_id>.pt (always saved), loaded on first use and only when
+    # that clean row completed without error. One turn per task is kept,
+    # CLONED: a slice keeps its whole parent storage alive, which is what
+    # made the old cache grow to 109GB. The same lookup feeds the circuit-
+    # breaker calibration, which previously only ever saw clean samples in
+    # runs that included obfuscated_activation.
+    if clean_activations_path.exists():
+        logger.info("%s is no longer used (references come from clean_<task>.pt).", clean_activations_path)
 
-    if needs_clean_cache and clean_activations_path.exists():
-        try:
-            clean_activations_by_task = torch.load(clean_activations_path, weights_only=False)
-            logger.info("Resumed %d cached clean activations from %s", len(clean_activations_by_task), clean_activations_path)
-        except Exception as e:
-            logger.warning(
-                "Failed to load %s (%s: %s) -- starting this run's clean-activation cache "
-                "fresh instead of crashing the whole resume. Already-recorded "
-                "obfuscated_activation rows in attack_results.json are unaffected.",
-                clean_activations_path, type(e).__name__, e,
-            )
-    elif not needs_clean_cache and clean_activations_path.exists():
-        logger.info("%s exists but is unused by this run's attacks -- not loading it.", clean_activations_path)
+    def _clean_ref(task_id: str) -> Optional[Dict[int, torch.Tensor]]:
+        if task_id not in clean_activations_by_task:
+            sid = f"clean_{task_id}"
+            p = output_dir / f"{sid}.pt"
+            if _is_complete(sid) and p.exists():
+                try:
+                    turns = torch.load(p, weights_only=False)
+                except Exception as e:
+                    logger.warning("could not load %s (%s: %s)", p.name, type(e).__name__, e)
+                    turns = None
+                if turns:
+                    clean_activations_by_task[task_id] = {
+                        k: (v.detach().clone() if torch.is_tensor(v) else v)
+                        for k, v in turns[obfuscation_clean_turn].items()}
+        return clean_activations_by_task.get(task_id)
 
     def _persist() -> None:
-        nonlocal _clean_cache_dirty
-        with open(results_log_path, "w") as f:
-            json.dump(results_log, f, indent=2)
-        with open(adv_payloads_path, "w") as f:
-            json.dump(
-                [
-                    {"attack_name": a, "task_id": t, "injections": inj}
-                    for (a, t), inj in adv_payloads.items()
-                ],
-                f, indent=2,
-            )
-        if needs_clean_cache and _clean_cache_dirty:
-            torch.save(clean_activations_by_task, clean_activations_path)
-            _clean_cache_dirty = False
+        # Atomic, and payloads BEFORE results: a kill between the two must
+        # never leave a completed attacked row whose payload is missing
+        # (review 4, H2).
+        atomic_write_json(adv_payloads_path, [
+            {"attack_name": a, "task_id": t, "injections": inj,
+             "metadata": adv_payload_meta.get((a, t), {}),
+             **adv_payload_stamps.get((a, t), {})}
+            for (a, t), inj in adv_payloads.items()
+        ], indent=2, default=str)
+        atomic_write_json(results_log_path, results_log, indent=2)
 
     wandb_run = _wandb_init_if_requested(
         use_wandb, wandb_project, wandb_run_name,
@@ -989,11 +862,8 @@ def run_agentdojo_attack_matrix(
             )
         episode_time_s = time.perf_counter() - t0
 
-        torch.save(clean_out["turn_activations"], output_dir / f"{sample_id}.pt")
+        atomic_torch_save(clean_out["turn_activations"], output_dir / f"{sample_id}.pt")
         if clean_out["turn_activations"]:
-            if needs_clean_cache:
-                clean_activations_by_task[task.task_id] = clean_out["turn_activations"][obfuscation_clean_turn]
-                _clean_cache_dirty = True
             if enable_task_tracker and len(clean_out["turn_activations"]) >= 2:
                 turns = clean_out["turn_activations"]
                 if tt_layer in turns[0] and tt_layer in turns[-1]:
@@ -1012,6 +882,7 @@ def run_agentdojo_attack_matrix(
             "peak_cuda_memory_gb": mem["peak_gb"],
             "error": episode_error,
             "tool_calls": clean_out["turn_tool_calls"],
+            "double_bos": clean_out.get("double_bos"),
             "raw_completions": [c[:400] for c in clean_out["turn_raw_completions"]],
         }
         _record_result(sample_id, row)
@@ -1039,7 +910,7 @@ def run_agentdojo_attack_matrix(
 
     for attack_name in attack_names:
         if attack_name == "obfuscated_activation":
-            layer = obfuscation_target_layer if obfuscation_target_layer is not None else target_layers[0]
+            layer = obf_layer
             attack = ObfuscatedActivationAttack(
                 model, processor, extractor,
                 geometry_weight=obfuscation_geometry_weight, target_layer=layer,
@@ -1055,10 +926,11 @@ def run_agentdojo_attack_matrix(
                 logger.info("  skip %s (already done)", sample_id)
                 continue
 
-            if attack_name == "obfuscated_activation" and task.task_id not in clean_activations_by_task:
+            if attack_name == "obfuscated_activation" and (
+                    _clean_ref(task.task_id) is None or layer not in _clean_ref(task.task_id)):
                 logger.warning(
                     "  skip %s for obfuscated_activation: no clean-episode activation available "
-                    "(that task's clean run produced zero turns)", task.task_id,
+                    "(clean run incomplete, errored, or produced zero turns)", task.task_id,
                 )
                 _row_skip(sample_id, attack_name, task, "no clean-episode activation for this task")
                 continue
@@ -1088,15 +960,29 @@ def run_agentdojo_attack_matrix(
                 # THE task's OWN real clean-episode activation -- see
                 # function docstring for why this replaced an earlier
                 # (wrong) Phase-1-baseline-file approach.
-                gen_kwargs["clean_reference_activation"] = clean_activations_by_task[task.task_id][layer]
+                gen_kwargs["clean_reference_activation"] = _clean_ref(task.task_id)[layer]
 
+            # A payload already stored for this (attack, task) -- written by
+            # an earlier process whose episode for this cell errored -- is
+            # REUSED, never regenerated: its defended cells may already have
+            # run with it (review 4, H1; the VWA runner does the same).
+            stored_key = (attack_name, task.task_id)
+            if stored_key in adv_payloads:
+                class _Stored:                       # stand-in for an AttackResult
+                    adversarial_text = None
+                    metadata = dict(adv_payload_meta.get(stored_key) or {}, payload_reused_from_store=True)
+                stored = _Stored()
+            else:
+                stored = None
             cache_key = (attack_name, task.suite_name, tuple(vector_ids), task.target_behavior)
             cached = None if attack_name == "obfuscated_activation" else _gen_cache.get(cache_key)
             t0 = time.perf_counter()
             attack_generation_error: Optional[str] = None
             try:
                 with _cuda_memory_guard() as gen_mem:
-                    if cached is not None:
+                    if stored is not None:
+                        adv_result = stored
+                    elif cached is not None:
                         adv_result = cached
                     else:
                         adv_result = attack.generate(
@@ -1125,12 +1011,39 @@ def run_agentdojo_attack_matrix(
                 _wandb_log(wandb_run, **row)
                 _persist()
                 continue
+            except Exception as e:
+                # Any other generation failure is PER-TASK: record it and go
+                # on. Uncaught, one task that fails the same way every time
+                # (e.g. in a rebuilt gradient attack) would stop every later
+                # task, attack and defence on every resubmit (review 5, H2).
+                gc.collect()
+                attack_generation_time_s = time.perf_counter() - t0
+                logger.exception("  FAILED: %s -- attack generation raised", sample_id)
+                row = {
+                    "sample_id": sample_id, "condition": "attacked", "attack_name": attack_name,
+                    "defense_name": "none", "task_id": task.task_id, "suite_name": task.suite_name,
+                    "injection_vectors": vector_ids, "asr_success": None, "utility_success": None,
+                    "num_turns": 0, "attack_generation_time_s": attack_generation_time_s,
+                    "error": f"attack_generation_{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}",
+                }
+                _record_result(sample_id, row)
+                _wandb_log(wandb_run, **row)
+                _persist()
+                continue
             attack_generation_time_s = time.perf_counter() - t0
 
-            injections = _splice(adv_result.adversarial_text, clean_vector_text,
-                                 injection_defaults, vector_ids)
-            adv_payloads[(attack_name, task.task_id)] = injections
-            payload_reused = cached is not None
+            if stored is not None:
+                injections = adv_payloads[stored_key]
+            else:
+                injections = _splice(adv_result.adversarial_text, clean_vector_text,
+                                     injection_defaults, vector_ids,
+                                     replace=bool((adv_result.metadata or {}).get("replaces_vector_content")))
+                adv_payloads[stored_key] = injections
+                adv_payload_stamps[stored_key] = {
+                    "attack_sha256": _ATK_SHA.get(attack_name), "model_id": _MODEL_ID}
+                adv_payload_meta[stored_key] = dict(adv_result.metadata or {})
+                _persist()           # the payload is on disk before its episode runs
+            payload_reused = cached is not None or stored is not None
 
             t0 = time.perf_counter()
             with _cuda_memory_guard() as ep_mem:
@@ -1140,7 +1053,7 @@ def run_agentdojo_attack_matrix(
                 )
             episode_time_s = time.perf_counter() - t0
 
-            torch.save(episode_out["turn_activations"], output_dir / f"{sample_id}.pt")
+            atomic_torch_save(episode_out["turn_activations"], output_dir / f"{sample_id}.pt")
 
             # Circuit-breaker calibration data collection -- ONLY during
             # the bootstrapping attack's own loop (see
@@ -1152,11 +1065,11 @@ def run_agentdojo_attack_matrix(
                 and attack_name == cb_first_attack_name
                 and episode_out["turn_activations"]
                 and cb_layer in episode_out["turn_activations"][-1]
-                and task.task_id in clean_activations_by_task
-                and cb_layer in clean_activations_by_task[task.task_id]
+                and _clean_ref(task.task_id) is not None
+                and cb_layer in _clean_ref(task.task_id)
             ):
                 cb_attacked_samples.append(episode_out["turn_activations"][-1][cb_layer])
-                cb_clean_samples.append(clean_activations_by_task[task.task_id][cb_layer])
+                cb_clean_samples.append(_clean_ref(task.task_id)[cb_layer])
 
             row = {
                 "sample_id": sample_id,
@@ -1177,6 +1090,7 @@ def run_agentdojo_attack_matrix(
                 "peak_cuda_memory_gb_episode": ep_mem["peak_gb"],
                 "error": episode_error,
                 "tool_calls": episode_out["turn_tool_calls"],
+                "double_bos": episode_out.get("double_bos"),
                 "raw_completions": [c[:400] for c in episode_out["turn_raw_completions"]],
                 **{f"attack_meta_{k}": v for k, v in adv_result.metadata.items()},
                 **_measure_task_tracker(task_tracker, episode_out["turn_activations"], tt_layer),
@@ -1226,7 +1140,7 @@ def run_agentdojo_attack_matrix(
                 # model_name is not in scope here (it is a parameter of
                 # _load_model_by_name). Derive the prober path from the
                 # output directory instead, which encodes the model.
-                _pp = f"defenses/icon_prober_{Path(output_dir).name.split('_')[-1]}.pt"
+                _pp = _icon_prober_path
                 if _os.path.exists(_pp):
                     icon_obj.prober = load_prober(_pp)
                     logger.info("ICON: loaded trained prober from %s", _pp)
@@ -1260,7 +1174,7 @@ def run_agentdojo_attack_matrix(
                     )
                 episode_time_s = time.perf_counter() - t0
 
-                torch.save(out["turn_activations"], output_dir / f"{sample_id}.pt")
+                atomic_torch_save(out["turn_activations"], output_dir / f"{sample_id}.pt")
                 row = {
                     "sample_id": sample_id,
                     "condition": "defended_clean",
@@ -1275,8 +1189,9 @@ def run_agentdojo_attack_matrix(
                     "peak_cuda_memory_gb": mem["peak_gb"],
                     "error": episode_error,
                     "tool_calls": out["turn_tool_calls"],
+                    "double_bos": out.get("double_bos"),
                     "raw_completions": [c[:400] for c in out["turn_raw_completions"]],
-"icon_info": out.get("turn_icon_info") or [],
+                    "icon_info": out.get("turn_icon_info") or [],
                     **_measure_task_tracker(task_tracker, out["turn_activations"], tt_layer),
                     **_measure_circuit_breaker(circuit_breaker, out["turn_activations"], cb_layer),
                 }
@@ -1318,7 +1233,7 @@ def run_agentdojo_attack_matrix(
                         )
                     episode_time_s = time.perf_counter() - t0
 
-                    torch.save(out["turn_activations"], output_dir / f"{sample_id}.pt")
+                    atomic_torch_save(out["turn_activations"], output_dir / f"{sample_id}.pt")
                     row = {
                         "sample_id": sample_id,
                         "condition": "defended_attacked",
@@ -1335,8 +1250,9 @@ def run_agentdojo_attack_matrix(
                         "peak_cuda_memory_gb": mem["peak_gb"],
                         "error": episode_error,
                         "tool_calls": out["turn_tool_calls"],
+                        "double_bos": out.get("double_bos"),
                         "raw_completions": [c[:400] for c in out["turn_raw_completions"]],
-"icon_info": out.get("turn_icon_info") or [],
+                        "icon_info": out.get("turn_icon_info") or [],
                         **_measure_task_tracker(task_tracker, out["turn_activations"], tt_layer),
                         **_measure_circuit_breaker(circuit_breaker, out["turn_activations"], cb_layer),
                     }

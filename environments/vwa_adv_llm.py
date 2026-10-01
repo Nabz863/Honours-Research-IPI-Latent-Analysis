@@ -84,6 +84,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import re
+
 import torch
 from PIL import Image
 
@@ -307,7 +309,8 @@ class LocalVLMBackend:
         # Reachability, per agent step (audit 11.11): does the injected
         # caption text appear in the prompt the model is given? Checked on
         # the prompt BEFORE any defence transforms it.
-        self.payload_markers = [m for m in (payload_markers or []) if m]
+        # Whitespace-normalised on both sides (review 3, #14).
+        self.payload_markers = [" ".join(m.split()) for m in (payload_markers or []) if m and m.strip()]
         self.payload_in_prompt: List[bool] = []
         # Greedy decoding makes a parse-failure retry identical to the call
         # it retries; VWA's PromptAgent re-calls with the SAME prompt
@@ -317,6 +320,8 @@ class LocalVLMBackend:
         self._last_response: Optional[str] = None
         self.retries_deduplicated = 0
         self.defense_unmatched_steps = 0
+        self.prev_action_defended = 0
+        self.double_bos: Optional[bool] = None
 
     def generate(self, prompt: Dict[str, Any]) -> str:
         """Apply defences, then generate once.
@@ -336,6 +341,7 @@ class LocalVLMBackend:
             raw_text = " ".join(
                 b.get("text", "") for m in conversation for b in (m.get("content") or [])
                 if isinstance(b, dict) and b.get("type") == "text")
+            raw_text = " ".join(raw_text.split())
             self.payload_in_prompt.append(any(mk in raw_text for mk in self.payload_markers))
 
         if self.defense is not None:
@@ -387,6 +393,9 @@ class LocalVLMBackend:
         inputs = self.processor(images=images, text=text, return_tensors="pt")
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         input_length = inputs["input_ids"].shape[1]
+        if self.double_bos is None:
+            from environments.agentdojo_llm import _has_double_bos
+            self.double_bos = _has_double_bos(self.processor, inputs["input_ids"])
 
         with self.extractor:
             with torch.no_grad():
@@ -421,9 +430,9 @@ class LocalVLMBackend:
         """ECSO replaces generation rather than transforming content, so
         it cannot ride the self.defense path. It calls back into
         _raw_generate for each of its four steps; activations are
-        captured on every one of them, which means step_activations for
-        an ECSO step holds up to four entries rather than one. Analysis
-        must account for that -- see defenses/ecso.py."""
+        captured on every one of them, and then reduced to ONE entry per
+        step: the activation of the generation whose output is returned
+        (see below)."""
         mark = len(self.step_activations)
 
         def gen(conv, imgs, n):
@@ -445,25 +454,66 @@ class LocalVLMBackend:
         self.ecso_info.append(meta)
         return r.response
 
-    _OBS_RE = None
-
-    def _defend_text(self, raw: str) -> Tuple[str, Optional[str], bool]:
+    def _defend_text(self, raw: str) -> Tuple[str, List[str], bool]:
         """Defends ONLY the observation inside VWA's template block
-        ('OBSERVATION: ... \nURL: ...\nOBJECTIVE: ...'), leaving the URL,
-        the user's objective and the previous action untouched (audit
-        11.3). Returns (text, addendum, matched_template)."""
-        import re as _re
-        if LocalVLMBackend._OBS_RE is None:
-            LocalVLMBackend._OBS_RE = _re.compile(r"\A(OBSERVATION:[ \t]*\n?)(.*?)(\nURL:)", _re.DOTALL)
-        m = LocalVLMBackend._OBS_RE.match(raw)
+        ('OBSERVATION: ... \nURL: ...\nOBJECTIVE: ...'), leaving the URL
+        and the user's objective untouched (audit 11.3). In PREVIOUS
+        ACTION, only the page-derived element text is defended (review 3,
+        #5); the action verb and element id stay readable.
+        Returns (text, addenda, matched_template)."""
+        # The observation ends at the LAST "\nURL: " -- the tail (URL,
+        # OBJECTIVE, PREVIOUS ACTION) is written by the harness, whereas
+        # page text (including an attacker's caption) can itself contain
+        # "\nURL:" and would otherwise end the defended region early
+        # (review C7).
+        head = "OBSERVATION:"
+        if not raw.startswith(head):
+            return raw, [], False
+        cut = raw.rfind("\nURL:")
+        if cut == -1:
+            return raw, [], False
+        start = len(head)
+        while start < len(raw) and raw[start] in " \t":
+            start += 1
+        if start < len(raw) and raw[start] == "\n":
+            start += 1
+        obs = raw[start:cut]
+        r = self._defend_cached(obs)
+        tail, tail_add = self._defend_prev_action(raw[cut:])
+        adds = [a for a in (r.system_prompt_addendum, tail_add) if a]
+        return raw[:start] + r.transformed_content + tail, adds, True
+
+    def _defend_cached(self, text: str):
+        if text not in self._defense_cache:
+            self._defense_cache[text] = self.defense.apply(text)
+        return self._defense_cache[text]
+
+    # VWA describes a click/hover/type on an element as
+    #   "<action> [<id>] where [<id>] is <element text>"
+    # and <element text> is PAGE-derived: after the agent clicks the victim
+    # image it carries the (possibly adversarial) caption into PREVIOUS
+    # ACTION, outside the OBSERVATION block (review 3, #5).
+    _PREV_ACTION_RE = re.compile(r"^(\w+ \[[^\]]*\] where \[[^\]]*\] is )(.+)$", re.DOTALL)
+
+    def _defend_prev_action(self, tail: str):
+        """Defends the page-derived element text inside PREVIOUS ACTION,
+        leaving the agent's own action verb and element id readable.
+        Returns (tail, addendum or None) -- the delimiting variant's
+        addendum names its boundary, so this block needs its own."""
+        key = "\nPREVIOUS ACTION:"
+        i = tail.rfind(key)
+        if i == -1:
+            return tail, None
+        j = i + len(key)
+        while j < len(tail) and tail[j] == " ":
+            j += 1
+        value = tail[j:]
+        m = self._PREV_ACTION_RE.match(value)
         if not m:
-            return raw, None, False
-        obs = m.group(2)
-        if obs not in self._defense_cache:
-            self._defense_cache[obs] = self.defense.apply(obs)
-        r = self._defense_cache[obs]
-        return (m.group(1) + r.transformed_content + raw[m.start(3):],
-                r.system_prompt_addendum or None, True)
+            return tail, None
+        self.prev_action_defended += 1
+        r = self._defend_cached(m.group(2))
+        return tail[:j] + m.group(1) + r.transformed_content, (r.system_prompt_addendum or None)
 
     def _defend(self, conversation):
         """Defends the untrusted observation and tells the model how
@@ -492,10 +542,11 @@ class LocalVLMBackend:
             blocks = []
             for b in msg.get("content", []):
                 if isinstance(b, dict) and b.get("type") == "text":
-                    text, add, matched = self._defend_text(b.get("text", ""))
+                    text, adds, matched = self._defend_text(b.get("text", ""))
                     matched_any = matched_any or matched
-                    if matched and add and add not in addenda:
-                        addenda.append(add)
+                    for add in adds:
+                        if add not in addenda:
+                            addenda.append(add)
                     blocks.append({"type": "text", "text": text})
                 else:
                     blocks.append(b)

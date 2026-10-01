@@ -261,14 +261,29 @@ def steer_attention_scores(
         if h >= scores.shape[1]:
             continue
         head = out[:, h]                                # [B, Q, K]
-        visible = head
         if attention_mask is not None:
             m = attention_mask[:, 0] if attention_mask.dim() == 4 else attention_mask
-            visible = head + m[..., : head.shape[-1]].to(head.dtype)
-        # theta = (1 - tau) percentile along the visible keys, per query row.
-        k = max(1, int(head.shape[-1] * tau))
-        thresh = visible.topk(k, dim=-1).values[..., -1:].expand_as(head)
-        sel = (visible >= thresh) & torch.isfinite(visible)
+            m = m[..., : head.shape[-1]]
+            if m.dtype == torch.bool:
+                vis = m                                   # True = may attend
+            else:
+                # HF masks with finfo(dtype).min (finite), so "masked" is a
+                # very large negative value, not -inf (review C6). The
+                # threshold must use the MASK's own dtype: fp16's min is
+                # -65504, far above float32's min/2, so a float32 threshold
+                # counted every masked key as visible (review 3, #10).
+                vis = m > (torch.finfo(m.dtype).min / 2) if m.is_floating_point() else m != 0
+        else:
+            vis = torch.ones_like(head, dtype=torch.bool)
+        vis = vis.expand_as(head)
+        # theta = (1 - tau) percentile over the VISIBLE keys of each query
+        # row: k = max(1, floor(n_visible * tau)) per row.
+        n_vis = vis.sum(dim=-1, keepdim=True)
+        k_row = torch.clamp((n_vis.float() * tau).floor().long(), min=1)
+        masked_scores = head.float().masked_fill(~vis, float("-inf"))
+        sorted_vals = masked_scores.sort(dim=-1, descending=True).values
+        thresh = sorted_vals.gather(-1, (k_row - 1).clamp(max=head.shape[-1] - 1))
+        sel = vis & (head.float() >= thresh)
         out[:, h] = head + sel.to(head.dtype) * log_g
     return out
 

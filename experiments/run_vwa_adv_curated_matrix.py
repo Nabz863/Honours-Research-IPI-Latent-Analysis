@@ -77,14 +77,22 @@ from attacks.comet import CometAttack
 from attacks.obfuscated_activation import ObfuscatedActivationAttack
 from attacks.shipped_transfer import ShippedImageAttack
 from extraction.hooks import ActivationExtractor
-from environments.self_captioner import SelfCaptioner, clear_caption_cache
-from experiments.code_version import code_version
-from experiments.run_attack_matrix import _cuda_memory_guard, _run_episode_safely
+from environments.self_captioner import (SelfCaptioner, clear_caption_cache, seed_caption,
+                                         CAPTION_PROMPT, FALLBACK_CAPTION, MAX_SIDE)
+from experiments.code_version import (code_version, check_resume_compatible, attack_code_sha,
+                                      dir_sha, files_sha, spotlight_seed_sha, write_manifest)
+from experiments.episode_utils import (_cuda_memory_guard, _run_episode_safely, _build_defense_registry,
+                                       atomic_write_json, atomic_write_text, atomic_torch_save,
+                                       atomic_save_image)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"url:\s*(\S+?)\]?$")
+
+
+class _ReusePayload(Exception):
+    """Internal signal: a persisted payload exists; skip generation."""
 
 
 class CuratedTask:
@@ -267,6 +275,10 @@ def run_curated_matrix(
         logger.info("--only_tasks: restricted to %d task(s)", len(usable))
     if max_tasks:
         usable = usable[:max_tasks]
+    if not usable:
+        # A typo in --only_tasks or --site would otherwise "complete" a run
+        # of zero episodes (review 3, #4).
+        raise SystemExit(f"FATAL: no tasks selected (site={site!r}, only_tasks={only_tasks})")
 
     extractor = ActivationExtractor(model, target_layers=target_layers, token_aggregation="last")
     registry = _build_registry(model, processor, extractor)
@@ -296,27 +308,24 @@ def run_curated_matrix(
     _payload_dir.mkdir(exist_ok=True)
 
     def _payload_save(attack_name, task_name, text, image, meta):
+        # Stamped with the attack's own code hash and the model, so a
+        # payload from before an attack rebuild, or from another model, is
+        # never reused (review 3, #3).
         d = _payload_dir / f"{attack_name}__{task_name}"
         d.mkdir(exist_ok=True)
         if image is not None:
-            image.save(d / "image.png", format="PNG")      # lossless
-        (d / "payload.json").write_text(json.dumps(
-            {"text": text, "has_image": image is not None, "meta": meta}, indent=1, default=str))
+            atomic_save_image(image, d / "image.png")      # lossless; atomic (review 4, H2)
+        # payload.json last: it is what marks the payload as present.
+        atomic_write_text(d / "payload.json", json.dumps(
+            {"text": text, "has_image": image is not None, "meta": meta,
+             "attack_sha256": _ATK_SHA.get(attack_name), "model_id": model_id},
+            indent=1, default=str))
 
-    for d in sorted(_payload_dir.glob("*__*")):
-        try:
-            _a, _t = d.name.split("__", 1)
-            j = json.loads((d / "payload.json").read_text())
-            _img = Image.open(d / "image.png").convert("RGB") if j.get("has_image") else None
-            _payloads[(_a, _t)] = (j.get("text"), _img, j.get("meta") or {})
-        except Exception as e:
-            logger.warning("could not reload payload %s (%s: %s)", d.name, type(e).__name__, e)
-    logger.info("resumed %d persisted payloads from %s", len(_payloads), _payload_dir)
 
     defense_registry = {}
     ecso_registry = {}
     if defense_names:
-        from experiments.run_attack_matrix import _build_defense_registry
+
         from defenses.visual import build_visual_defense_registry
         from defenses.ecso import build_ecso_registry
         # Three registries, because the three defence families enter the
@@ -338,9 +347,64 @@ def run_curated_matrix(
         if n not in registry:
             raise KeyError(f"Unknown attack {n!r} -- have {sorted(registry)}")
 
+    # Per-attack code hashes, run settings and defence configuration,
+    # stamped on rows and checked on resume (review 3, #3, #4, #13).
+    _ATK_SHA = {n: attack_code_sha(registry[n]) for n in attack_names}
+    _RUN_SETTINGS = {
+        "model_id": model_id, "site": site, "max_steps": max_steps,
+        "strict_asr_dir_sha": dir_sha(os.environ.get("STRICT_ASR_CONFIG_DIR")),
+        "clean_ua_dir_sha": dir_sha(os.environ.get("CLEAN_UA_CONFIG_DIR")),
+        "captioner": {"prompt": CAPTION_PROMPT, "max_side": MAX_SIDE, "max_new_tokens": 64},
+        # Inputs outside this repo that change what an episode is (review 4,
+        # M4): the agent prompt, visualwebarena's environment and evaluator
+        # code, and agent-attack's task data for the selected tasks.
+        "instruction_sha": files_sha([VWA_ADV_REPO / "agent/prompts/jsons/p_som_cot_id_actree_3s.json"],
+                                     base=VWA_ADV_REPO),
+        # visualwebarena code the episode runs: environment, evaluators,
+        # and the agent/prompt-constructor and llms packages the backend
+        # imports (review 5, M5). Paths hashed relative (review 5, M6).
+        "vwa_code_sha": {d: dir_sha(str(VWA_ADV_REPO / d), "*.py")
+                         for d in ("browser_env", "evaluation_harness", "agent", "llms")},
+        "task_data_sha": files_sha(
+            # every variant of the site, not just the selected ones, so a
+            # subset run (--only_tasks) resumes into the same directory
+            [f for t in tasks for f in sorted(t.adv_dir.iterdir()) if f.is_file()]
+            + [f for t in tasks for f in (t.clean_config, t.clean_obs_text)],
+            base=exp_data),
+    }
+    _DEF_SHA = {d: spotlight_seed_sha() for d in (defense_names or []) if d.startswith("spotlighting")}
+
+    # Transfer attacks need agent-attack's shipped images; say up front how
+    # many tasks have them (review 3, #8).
+    for n in attack_names:
+        atk = registry[n]
+        if isinstance(atk, ShippedImageAttack):
+            have = sum(1 for t in usable if (t.adv_dir / f"{atk.prefix}_attack_image.png").exists())
+            logger.info("%s: shipped image present for %d/%d tasks", n, have, len(usable))
+            if have == 0:
+                raise SystemExit(f"FATAL: {n}: no task has {atk.prefix}_attack_image.png -- "
+                                 "check the filename against exp_data/agent_adv/*/")
+
+    _stale = 0
+    for d in sorted(_payload_dir.glob("*__*")):
+        try:
+            _a, _t = d.name.split("__", 1)
+            if _a not in _ATK_SHA:
+                continue                    # not an attack of this run
+            j = json.loads((d / "payload.json").read_text())
+            if j.get("attack_sha256") != _ATK_SHA[_a] or j.get("model_id") != model_id:
+                _stale += 1                 # regenerated; the new one overwrites it
+                continue
+            _img = Image.open(d / "image.png").convert("RGB") if j.get("has_image") else None
+            _payloads[(_a, _t)] = (j.get("text"), _img, j.get("meta") or {})
+        except Exception as e:
+            logger.warning("could not reload payload %s (%s: %s)", d.name, type(e).__name__, e)
+    logger.info("resumed %d persisted payloads from %s (%d stale: other code or model, ignored)",
+                len(_payloads), _payload_dir, _stale)
+
     # SELF-CAPTIONING (decision 30 Sep): the agent model captions every page
     # image, as in the VWA-Adv paper's self-captioning configuration.
-    captioner = SelfCaptioner(model, processor, extractor=extractor)
+    captioner = SelfCaptioner(model, processor, max_new_tokens=64, extractor=extractor)
     env = ScriptBrowserEnv(headless=True, observation_type="image_som",
                            current_viewport_only=False, viewport_size={"width": 1280, "height": 2048},
                            captioning_fn=captioner)
@@ -348,37 +412,260 @@ def run_curated_matrix(
     logger.info("code version: commit=%s dirty=%s harness=%s attacks=%s",
                 _CV["commit"], _CV["dirty"], _CV["harness_sha256"][:12], _CV["attacks_sha256"][:12])
 
-    # Captions that depend on (image, blur): the victim's clean caption
-    # feeds text attacks; an image attack's caption is our model's caption
-    # of the adversarial image. Cached per blur setting.
-    _caption_cache: Dict[tuple, str] = {}
+    # ---- captions -----------------------------------------------------
+    # Captions depend on (image, blur). The victim's CLEAN caption is seeded
+    # into VWA's cache before EVERY episode, for the current blur setting,
+    # so that (a) clean, attacked and defended episodes see the same clean
+    # description, and (b) an adversarial caption always has a description
+    # to replace -- VWA's captioned branch only substitutes over an existing
+    # one (review C2, C4).
+    # PERSISTED (review 3, #6): every caption -- the victim's clean and
+    # attacked captions, and VWA's captions of every other page image -- is
+    # saved to captions.json and reloaded on resume, so a resume (possibly
+    # on another GPU type, where a greedy caption can differ) shows the
+    # agent exactly the page text the earlier rows saw. A fallback caption
+    # (captioner failure) is never cached or saved, so the next episode
+    # retries it (review 3, #7).
+    _caption_cache: Dict[tuple, str] = {}           # (kind, key, sigma) -> caption
+    _page_caps: Dict[tuple, str] = {}               # (url, sigma) -> caption, other page images
+    # Page images (not the victim) the captioner has failed on. A first
+    # failure errors the row so it is retried; a SECOND non-OOM failure on
+    # the same image is treated as deterministic: the fallback is persisted
+    # as that image's caption (flagged), seeded identically for every
+    # condition, and rows complete -- otherwise one unreadable image on a
+    # common page would make every episode fail forever (review 5, H1).
+    _page_fail_counts: Dict[tuple, int] = {}
+    _page_failed: set = set()
+    _captions_path = output_dir / "captions.json"
+    if _captions_path.exists():
+        try:
+            _cj = json.loads(_captions_path.read_text())
+            if _cj.get("run_settings") != _RUN_SETTINGS:
+                # Another model, captioner or task set wrote these. Rows it
+                # completed are refused by the resume check below; with
+                # only error rows, starting the captions afresh is right
+                # (review 4, L5).
+                logger.warning("captions.json was written under different run settings -- ignoring it")
+                _cj = {}
+            for e in _cj.get("self", []):
+                _caption_cache[(e["kind"], e["key"], e["sigma"])] = e["caption"]
+            for e in _cj.get("page", []):
+                _page_caps[(e["url"], e["sigma"])] = e["caption"]
+                if e.get("failed"):
+                    _page_failed.add((e["url"], e["sigma"]))
+            for e in _cj.get("page_fail_counts", []):
+                _page_fail_counts[(e["url"], e["sigma"])] = e["n"]
+            logger.info("resumed %d victim and %d page-image captions from %s",
+                        len(_caption_cache), len(_page_caps), _captions_path)
+        except Exception as e:
+            raise SystemExit(f"FATAL: {_captions_path} unreadable ({type(e).__name__}: {e}); "
+                             "resuming without it would re-caption and could change page text")
+
+    def _save_captions():
+        atomic_write_json(_captions_path, {                 # atomic (review 4, H2)
+            "run_settings": _RUN_SETTINGS,
+            "self": [{"kind": k, "key": key, "sigma": sg, "caption": c}
+                     for (k, key, sg), c in _caption_cache.items()],
+            "page": [{"url": u, "sigma": sg, "caption": c, "failed": (u, sg) in _page_failed}
+                     for (u, sg), c in _page_caps.items()],
+            "page_fail_counts": [{"url": u, "sigma": sg, "n": n} for (u, sg), n in _page_fail_counts.items()],
+        }, indent=1)
+
+    _blur_state: Dict[str, Any] = {"def": None}     # page-level blur of the current pass
+    _victims: Dict[str, tuple] = {}
+
+    def _sigma():
+        return getattr(_blur_state["def"], "sigma", None)
+
+    # Whether the most recent _self_caption() call fell back. Decided by the
+    # captioner's failure counter, never by comparing text, so a genuine
+    # caption that happens to read "an image" is not mistaken for a failure
+    # (review 4, L2).
+    _cap_failed = {"v": False}
 
     def _self_caption(kind: str, key: str, image, blur_def=None) -> str:
         ck = (kind, key, getattr(blur_def, "sigma", None))
-        if ck not in _caption_cache:
-            captioner.set_blur(blur_def)
-            try:
-                _caption_cache[ck] = captioner([image])[0]
-            finally:
-                captioner.set_blur(None)
-        return _caption_cache[ck]
+        if ck in _caption_cache:
+            _cap_failed["v"] = False
+            return _caption_cache[ck]
+        prev = captioner.blur                       # restore, never reset (review C1)
+        captioner.set_blur(blur_def)
+        n_fail = captioner.n_failures
+        try:
+            cap = captioner([image])[0]             # never raises (safe_caption)
+        finally:
+            captioner.set_blur(prev)
+        _cap_failed["v"] = captioner.n_failures != n_fail
+        if not _cap_failed["v"]:
+            _caption_cache[ck] = cap
+            _save_captions()
+        return cap
 
-    def _victim_caption(text, image, attack_name, task_name, blur_def=None):
+    def _image_key(image) -> str:
+        """Content key for an attack image: a regenerated image must never
+        be shown with the previous image's caption (review 4, H3)."""
+        import hashlib as _h
+        return _h.sha256(f"{image.mode}{image.size}".encode() + image.tobytes()).hexdigest()
+
+    def _sync_page_captions(victim_url, oom: bool, failed_this_episode: int, trajectory=None):
+        """After an episode: keep VWA's captions of the OTHER page images
+        (not the victim, whose caption is seeded; not data: URLs, which are
+        substituted attack images), and handle fallbacks (review 5, H1):
+          * after an out-of-memory failure: dropped from VWA's cache, so
+            they are retried -- OOM is transient;
+          * a first non-OOM failure on an image: dropped and counted;
+          * a second non-OOM failure on the same image: deterministic --
+            the fallback is persisted as that image's caption, flagged, and
+            seeded for every condition from then on.
+        Returns (pending, persisted_fallbacks_on_page): `pending` > 0 means
+        this episode saw a fallback that later episodes may not see, so the
+        row must be retried."""
+        cache = getattr(getattr(getattr(env, "observation_handler", None), "text_processor", None),
+                        "url2caption", None)
+        if not isinstance(cache, dict):
+            return 0, 0
+        changed = False
+        pending = 0
+        # Fallback-looking entries this episode. If there are more of them
+        # than captioner failures, some are genuine captions reading "an
+        # image" and they cannot be told apart: retry the row, persist
+        # nothing as failed (review 6, #3).
+        cands = [u for u, c in cache.items()
+                 if (u, _sigma()) not in _page_failed and u != victim_url
+                 and not str(u).startswith("data:") and (not c or c == FALLBACK_CAPTION)]
+        ambiguous = failed_this_episode > 0 and len(cands) > failed_this_episode
+        handled = 0
+        for u, c in list(cache.items()):
+            key = (u, _sigma())
+            if key in _page_failed:
+                continue
+            if u == victim_url or str(u).startswith("data:"):
+                if not c or c == FALLBACK_CAPTION:
+                    cache.pop(u, None)
+                continue
+            is_fallback = (not c) or (c == FALLBACK_CAPTION and failed_this_episode > 0 and not ambiguous)
+            if is_fallback:
+                handled += 1
+                cache.pop(u, None)
+                # OOM is usually transient, so it needs more repeats before
+                # the image is treated as uncaptionable (review 6, #8).
+                n = _page_fail_counts.get(key, 0) + 1
+                _page_fail_counts[key] = n
+                changed = True
+                if n >= (3 if oom else 2):
+                    _page_caps[key] = FALLBACK_CAPTION
+                    _page_failed.add(key)
+                    cache[u] = FALLBACK_CAPTION
+                    logger.warning("page image %s: captioner failed twice (%s) -- fallback caption "
+                                   "persisted for every condition", u, captioner.last_error)
+                else:
+                    pending += 1
+                continue
+            if key not in _page_caps:
+                _page_caps[key] = c
+                changed = True
+        # A failure that left no recognisable entry (review 6, #4), or an
+        # ambiguous set, still means this row may differ from its retry.
+        if failed_this_episode > handled:
+            pending += failed_this_episode - handled
+        if changed:
+            _save_captions()
+        # Persisted fallbacks counted only if their URL appears in THIS
+        # episode's observations -- VWA's cache also holds every seeded
+        # caption from other pages (review 6, #1).
+        obs_text = " ".join(str((st.get("observation") or {}).get("text", ""))
+                            for st in (trajectory or []) if isinstance(st, dict))
+        seen_failed = sum(1 for (u, sg) in _page_failed if sg == _sigma() and u in obs_text)
+        return pending, seen_failed
+
+    def _victim(task):
+        """(url, image) of the victim image, cached per task."""
+        if task.name not in _victims:
+            url = task.victim_image_url()
+            vp = task.victim_image_path()
+            img = Image.open(vp).convert("RGB") if vp is not None else (_fetch_image(url) if url else None)
+            _victims[task.name] = (url, img)
+        return _victims[task.name]
+
+    def _clean_caption(task, blur_def=None):
+        url, img = _victim(task)
+        return _self_caption("clean", task.name, img, blur_def) if img is not None else None
+
+    def _seed_victim(task):
+        """Seeds, for the current blur, the persisted captions of other page
+        images and the victim's clean caption. Returns an error string, or
+        None."""
+        try:
+            for (u, sg), c in _page_caps.items():
+                if sg == _sigma():
+                    seed_caption(env, u, c)
+        except Exception as e:
+            return f"caption seeding failed: {type(e).__name__}: {str(e)[:120]}"
+        url, img = _victim(task)
+        if not url or img is None:
+            return None     # handled by the attack path's own errors
+        cap = _clean_caption(task, _blur_state["def"])
+        if _cap_failed["v"]:
+            # The captioner failed on the victim image (e.g. a transient
+            # OOM). No row may complete with a placeholder where the
+            # victim's description belongs: recorded as an error, so a
+            # resubmit retries it (review 3, #7).
+            return f"victim caption unavailable (captioner failed: {captioner.last_error})"
+        try:
+            seed_caption(env, url, cap)
+        except Exception as e:
+            return f"caption seeding failed: {type(e).__name__}: {str(e)[:120]}"
+        return None
+
+    def _victim_caption(text, image, meta, attack_name, task, blur_def=None):
         """The caption the agent sees for the victim image under attack.
-        Attacker-written text (template IPI, COMET, ...) IS the caption;
-        otherwise our model captions the adversarial image, blurred if a
-        page-level blur is active."""
+        Attacker-written text IS the caption, built as <clean caption> +
+        <payload>; under blur the clean part is the BLURRED clean caption,
+        so attacked = clean + payload holds in every pass. An image-only
+        attack's caption is our model's caption of the adversarial image,
+        blurred if a page-level blur is active."""
         if text:
+            gen_clean = (meta or {}).get("clean_caption") or ""
+            if gen_clean and text.startswith(gen_clean):
+                return (_clean_caption(task, blur_def) or "") + text[len(gen_clean):], "attacker_text"
             return text, "attacker_text"
         if image is not None:
-            return _self_caption("adv", f"{attack_name}|{task_name}", image, blur_def), "self_caption"
+            cap = _self_caption("adv", _image_key(image), image, blur_def)
+            if _cap_failed["v"]:
+                return None, "caption_failed"
+            return cap, "self_caption"
         return None, None
 
     results_path = output_dir / "attack_results.json"
     results: List[Dict[str, Any]] = json.loads(results_path.read_text()) if results_path.exists() else []
     index = {r["sample_id"]: i for i, r in enumerate(results)}
+    _override = None
+    if results:
+        _override = check_resume_compatible(       # review C9; review 3 #4, #13
+            results, _CV, set(attack_names), attack_shas=_ATK_SHA,
+            run_settings=_RUN_SETTINGS, defense_shas=_DEF_SHA, output_dir=output_dir)
+    write_manifest(output_dir)
 
     def done(sid): return sid in index and results[index[sid]].get("error") is None
+
+    def _clean_ref(task):
+        """This task's clean reference activation (last step of its clean
+        episode). Loaded from clean_<task>.pt when the clean episode ran in
+        an earlier process -- a resumed or split run skips it, and the
+        in-memory cache would otherwise be empty (review 3, #1)."""
+        if task.name not in _clean_acts:
+            sid_c = f"clean_{task.name}"
+            p = output_dir / f"{sid_c}.pt"
+            if done(sid_c) and p.exists():
+                try:
+                    steps = torch.load(p, weights_only=False)
+                except Exception as e:
+                    logger.warning("could not load %s (%s)", p.name, e)
+                    steps = None
+                if steps:
+                    _clean_acts[task.name] = {k: (v.clone() if torch.is_tensor(v) else v)
+                                              for k, v in steps[-1].items()}
+        return _clean_acts.get(task.name)
 
     # Failures that are terminal for the whole process, not for one task.
     # env = ScriptBrowserEnv(...) is shared by every episode, so once the
@@ -399,13 +686,17 @@ def run_curated_matrix(
         "could not fetch victim image",
         "no clean reference activation",
         "no cached payload",
+        "not shipped for this task",
+        "victim caption unavailable",
+        "attack image caption failed",
+        "(first failure; retried)",
     )
     _MAX_CONSECUTIVE_ERRORS = 25
 
     _fail_streak = {"n": 0}
 
     def _abort(reason, sid):
-        results_path.write_text(json.dumps(results, indent=2))
+        atomic_write_json(results_path, results, indent=2)
         n_err = sum(1 for r in results if r.get("error"))
         logger.error("ABORTING: %s", reason)
         logger.error("  last sample: %s", sid)
@@ -419,12 +710,25 @@ def run_curated_matrix(
             f"them (done() requires error is None).")
 
     def record(sid, row):
+        # scoring_attempts survives a replacement by a DIFFERENT error, so
+        # the 3-attempt cap is reached (review 6, #2).
+        if (sid in index and "scoring_attempts" not in row
+                and results[index[sid]].get("scoring_attempts")):
+            row["scoring_attempts"] = results[index[sid]]["scoring_attempts"]
         row.setdefault("code_version", _CV)
+        row.setdefault("run_settings", _RUN_SETTINGS)
+        an, dn = row.get("attack_name"), row.get("defense_name")
+        if an in _ATK_SHA:
+            row.setdefault("attack_sha256", _ATK_SHA[an])
+        if dn in _DEF_SHA:
+            row.setdefault("defense_sha256", _DEF_SHA[dn])
+        if _override:
+            row.setdefault("resume_override", _override)
         if sid in index:
             results[index[sid]] = row
         else:
             results.append(row); index[sid] = len(results) - 1
-        results_path.write_text(json.dumps(results, indent=2))
+        atomic_write_json(results_path, results, indent=2)
 
         err = str(row.get("error") or "")
         if not err:
@@ -448,6 +752,8 @@ def run_curated_matrix(
         return caption.replace("\\", "\\\\")
 
     def _markers(adv_cap, clean_cap=None):
+        # Whitespace is normalised here and in the backend before matching
+        # (review 3, #14).
         """What to look for in the prompt to know the injected caption
         reached the model (audit 11.11): the first 60 characters of the
         part that is NOT the clean caption. Text attacks append to the
@@ -459,35 +765,101 @@ def run_curated_matrix(
             c = (c or "").strip()
             if clean_cap and c.startswith(clean_cap):
                 c = c[len(clean_cap):].strip()
-            if c and c != (clean_cap or "").strip():
+            c = " ".join(c.split())
+            if c and c != " ".join((clean_cap or "").split()):
                 out.append(c[:60])
         return out
 
-    def _episode_fields(out):
+    def _episode_fields(out, cap_before=None, task=None, blur_def=None):
         """Per-row diagnostics that used to be computed and discarded
-        (audit 11.4, 11.9, 11.11)."""
+        (audit 11.4, 11.9, 11.11), plus this episode's captioner activity."""
         pip = out.get("payload_in_prompt") or []
+        cb = cap_before or _cap_counts()
+        vcc = _clean_caption(task, blur_def) if task is not None else None
         return {
+            "victim_clean_caption": vcc,
+            "caption_calls_while_hooked": captioner.n_calls_while_hooked - cb[2],
+            "asr_scoring_error": out.get("asr_scoring_error"),
+            "final_url": out.get("final_url"),
+            "double_bos": out.get("double_bos"),
+            "blur_css_failures": out.get("blur_css_failures"),
+            "captions_this_episode": captioner.n_images - cb[0],
+            "caption_failures_this_episode": captioner.n_failures - cb[1],
             "defense_addenda": out.get("defense_addenda"),
             "defense_unmatched_steps": out.get("defense_unmatched_steps"),
+            "prev_action_defended": out.get("prev_action_defended"),
             "page_blur_css": out.get("page_blur_css"),
             "ecso_info": out.get("ecso_info"),
             "ecso_flagged_steps": sum(1 for e in (out.get("ecso_info") or []) if e.get("flagged")),
             "retries_deduplicated": out.get("retries_deduplicated"),
             "payload_in_prompt": pip,
             "payload_reached": (any(pip) if pip else None),
-            "captioner_images": captioner.n_images,
         }
 
-    def score(config_path: Path, trajectory) -> Optional[bool]:
-        """Scores an already-finished episode against a config's evaluator."""
+    _MAX_SCORING_ATTEMPTS = 3
+
+    def _final_error(err, out, ua_err, cap_before, task, sid):
+        """Returns (error, extra row fields). A row only completes if what
+        makes it comparable held; otherwise it is an ERROR row, which a
+        resubmit retries (activations are still saved).
+          * a caption pass while activation hooks were live (review 4, L4);
+          * a captioner out-of-memory failure, or a FIRST failure on a page
+            image (review 4 L3, review 5 H1 -- a repeated failure is
+            persisted and no longer errors, see _sync_page_captions);
+          * an ASR/UA scoring failure (review 4, M1): the evaluators read
+            LIVE page state, so a transient failure cannot be re-scored
+            offline and the episode is retried -- but at most
+            _MAX_SCORING_ATTEMPTS times; after that the row completes with
+            the scoring error recorded and scoring_error_final=True, for
+            exclusion, so a deterministic evaluator failure cannot block the
+            run forever (review 5, H1)."""
+        oom = captioner.n_oom - cap_before[3] > 0
+        pending, seen_failed = _sync_page_captions(
+            _victim(task)[0], oom, captioner.n_failures - cap_before[1], out.get("trajectory"))
+        extra = {"page_caption_fallbacks": seen_failed}
+        if err is not None:
+            return err, extra
+        probs = []
+        if captioner.n_calls_while_hooked - cap_before[2] > 0:
+            probs.append("caption pass ran while activation hooks were registered")
+        if pending:
+            probs.append(f"captioner failed on {pending} page image(s) (first failure; retried): "
+                         f"{captioner.last_error}")
+        scoring = []
+        if out.get("asr_scoring_error"):
+            scoring.append(f"ASR scoring failed: {out['asr_scoring_error']}")
+        if ua_err:
+            scoring.append(f"UA scoring failed: {ua_err}")
+        if scoring:
+            prior = results[index[sid]].get("scoring_attempts", 0) if sid in index else 0
+            extra["scoring_attempts"] = prior + 1
+            if prior + 1 >= _MAX_SCORING_ATTEMPTS and not probs:
+                extra["scoring_error_final"] = True
+                logger.warning("  %s: scoring failed %d times -- completing the row with the "
+                               "scoring error recorded (exclude it)", sid, prior + 1)
+            else:
+                probs.extend(scoring)
+        return (("post-episode: " + "; ".join(probs))[:400] if probs else None), extra
+
+    def _cap_counts():
+        return (captioner.n_images, captioner.n_failures, captioner.n_calls_while_hooked, captioner.n_oom)
+
+    def score(config_path: Path, trajectory, final_url: Optional[str] = None):
+        """Scores a finished episode against a config's evaluator. Returns
+        (verdict, error). The in-episode ASR evaluation may have navigated
+        the page, so the agent's final page is restored first (review A7);
+        a failure is RETURNED, not swallowed, so the row says why its UA is
+        missing (review A8)."""
         try:
+            if final_url and env.page.url != final_url:
+                env.page.goto(final_url)
+                env.page.wait_for_load_state("load", timeout=30000)
             ev = evaluator_router(str(config_path), captioning_fn=None)
             return bool(ev(trajectory=trajectory, config_file=str(config_path),
-                           page=env.page, client=env.get_page_client(env.page)))
+                           page=env.page, client=env.get_page_client(env.page))), None
         except Exception as e:
             logger.warning("  scoring against %s failed (%s: %s)", config_path.name, type(e).__name__, e)
-            return None
+            return None, f"{type(e).__name__}: {str(e)[:160]}"
 
     try:
         for attack_name in ["clean"] + list(attack_names):
@@ -512,18 +884,20 @@ def run_curated_matrix(
                            "earlier browser failure poisoned this process; no "
                            "further episode can succeed", sid)
 
-                adv_cap, adv_img, meta, gen_s = {}, {}, {}, None
+                _blur_state["def"] = None
+                seed_err = _seed_victim(task)
+                if seed_err:
+                    record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
+                                 "error": seed_err})
+                    continue
+
+                adv_cap, adv_cap_raw, adv_img, meta, gen_s = {}, {}, {}, {}, None
                 if attack_name != "clean":
-                    url = task.victim_image_url()
+                    url, img = _victim(task)
                     if not url:
                         record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
                                      "error": "no victim image URL in recorded obs_text.txt"})
                         continue
-                    vp = task.victim_image_path()
-                    if vp is not None:
-                        img = Image.open(vp).convert("RGB")
-                    else:
-                        img = _fetch_image(url)
                     if img is None:
                         record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
                                      "error": f"could not fetch victim image {url}"})
@@ -535,10 +909,15 @@ def run_curated_matrix(
                     # With self-captioning the victim image already HAS a
                     # caption; text attacks append to it, as an attacker
                     # editing the alt text would.
-                    clean_cap = _self_caption("clean", task.name, img)
+                    clean_cap = _clean_caption(task, None)
                     base_input = {"prompt": task.intent, "image": img,
                                   "injectable_field": "caption", "caption": clean_cap,
                                   "adv_dir": str(task.adv_dir)}
+
+                    # A payload already persisted for this (attack, task)
+                    # is REUSED, never regenerated: defended cells may
+                    # already have run with it (review C8).
+                    cached_payload = _payloads.get((attack_name, task.name))
 
                     # obfuscated_activation optimises its suffix to hold the
                     # attacked state near THIS task's own clean state, so the
@@ -546,8 +925,8 @@ def run_curated_matrix(
                     # Resolved here rather than inside the try below, where a
                     # `continue` would be illegal.
                     _ref_act = None
-                    if attack_name == "obfuscated_activation":
-                        _ref = _clean_acts.get(task.name)
+                    if attack_name == "obfuscated_activation" and cached_payload is None:
+                        _ref = _clean_ref(task)
                         _layer = target_layers[len(target_layers) // 2]
                         if not _ref or _layer not in _ref:
                             record(sid, {"sample_id": sid, "attack_name": attack_name,
@@ -558,6 +937,8 @@ def run_curated_matrix(
 
                     t0 = time.perf_counter()
                     try:
+                        if cached_payload is not None:
+                            raise _ReusePayload()
                         with _cuda_memory_guard():
                             atk = registry[attack_name]
                             if attack_name in ("template_ipi", "gcg"):
@@ -574,7 +955,12 @@ def run_curated_matrix(
                                 res = atk.generate(base_input, target_behavior=goal,
                                                    clean_reference_activation=_ref_act)
                             else:
-                                res = atk.generate(base_input, target_behavior=goal, image=img, clean_text="")
+                                # clean_text = the clean caption, so COMET and
+                                # CrossInject append to it like every other
+                                # text attack (review C5).
+                                res = atk.generate(base_input, target_behavior=goal, image=img, clean_text=clean_cap)
+                    except _ReusePayload:
+                        res = None
                     except torch.OutOfMemoryError as e:
                         torch.cuda.empty_cache(); gc.collect()
                         record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
@@ -585,49 +971,77 @@ def run_curated_matrix(
                         record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
                                      "error": f"attack_generation_{type(e).__name__}: {str(e).splitlines()[0][:200]}"})
                         continue
-                    gen_s = time.perf_counter() - t0
-                    meta = {f"attack_meta_{k}": v for k, v in (res.metadata or {}).items()}
-                    meta["victim_url"] = url
-                    meta["clean_caption"] = clean_cap
-                    _payloads[(attack_name, task.name)] = (res.adversarial_text, res.adversarial_image, meta)
-                    try:
-                        _payload_save(attack_name, task.name, res.adversarial_text,
-                                      res.adversarial_image, meta)
-                    except Exception as e:
-                        logger.warning("could not persist payload %s/%s: %s", attack_name, task.name, e)
-                    cap, cap_src = _victim_caption(res.adversarial_text, res.adversarial_image,
-                                                   attack_name, task.name)
+                    if res is None:
+                        ptext, pimg, meta = cached_payload
+                        meta = dict(meta)
+                        meta["payload_reused"] = True
+                        gen_s = 0.0
+                    else:
+                        gen_s = time.perf_counter() - t0
+                        ptext, pimg = res.adversarial_text, res.adversarial_image
+                        meta = {f"attack_meta_{k}": v for k, v in (res.metadata or {}).items()}
+                        meta["victim_url"] = url
+                        meta["clean_caption"] = clean_cap
+                        _payloads[(attack_name, task.name)] = (ptext, pimg, meta)
+                        try:
+                            _payload_save(attack_name, task.name, ptext, pimg, meta)
+                        except Exception as e:
+                            # An unsaved payload must not produce a completed
+                            # row: after a resume its defended cells could
+                            # never run (review 5, M3). Error row; retried.
+                            _payloads.pop((attack_name, task.name), None)
+                            record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
+                                         "error": f"payload could not be saved: {type(e).__name__}: {str(e)[:160]}"})
+                            continue
+                    cap_before = _cap_counts()
+                    cap, cap_src = _victim_caption(ptext, pimg, meta, attack_name, task, None)
+                    if cap_src == "caption_failed":
+                        # Captioning the attack image failed: no row may
+                        # complete with a placeholder as the victim's
+                        # description (review 4, H4). Retried on resubmit.
+                        record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
+                                     "error": f"attack image caption failed: {captioner.last_error}"})
+                        continue
                     if cap:
+                        adv_cap_raw[url] = cap
                         adv_cap[url] = _for_resub(cap)
-                    if res.adversarial_image is not None:
-                        adv_img[url] = res.adversarial_image
+                    if pimg is not None:
+                        adv_img[url] = pimg
                     meta["caption_source"] = cap_src
                     meta["victim_caption"] = cap
 
                 vwa_task = VWAAdvTask(config_file=task.adv_config, task_id=task.name, intent=task.intent)
+                if attack_name == "clean":
+                    cap_before = _cap_counts()
                 t0 = time.perf_counter()
                 with _cuda_memory_guard() as mem:
                     out, err = _run_episode_safely(
                         run_vwa_adv_episode, model, processor, extractor, model_id, vwa_task, env,
                         instruction_path=str(VWA_ADV_REPO / "agent/prompts/jsons/p_som_cot_id_actree_3s.json"),
                         max_steps=max_steps, adv_url2caption=adv_cap, adv_url2image=adv_img,
-                        payload_markers=_markers(adv_cap, meta.get("clean_caption")),
+                        payload_markers=_markers(adv_cap_raw, _clean_caption(task, None)),
                     )
                 ep_s = time.perf_counter() - t0
 
                 traj = out.get("trajectory")
-                asr = out.get("success") if attack_name != "clean" else (score(task.adv_config, traj) if traj else None)
-                ua = score(task.clean_config, traj) if (traj and task.ua_scorable) else None
+                # ONE ASR path for every condition: the in-episode evaluation
+                # of the adversarial config, run first on the agent's final
+                # page (review A7). UA is scored after restoring that page.
+                asr = out.get("success") if traj else None
+                ua, ua_err = score(task.clean_config, traj, out.get("final_url")) if (traj and task.ua_scorable) else (None, None)
 
-                torch.save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                fin_err, fin_extra = _final_error(err, out, ua_err, cap_before, task, sid)
                 if attack_name == "clean":
                     # obfuscated_activation optimises its suffix to keep the
                     # attacked state close to this task's own clean state, so
                     # the reference must be THIS task's clean activation, not a
                     # pooled baseline. Last step, matching the geometry
-                    # analysis: step 0 is pre-injection.
+                    # analysis: step 0 is pre-injection. Only from a clean
+                    # row that COMPLETES (review 5, M4) -- the same rule
+                    # _clean_ref applies in a later process.
                     steps = out.get("step_activations") or []
-                    if steps:
+                    if steps and fin_err is None:
                         _clean_acts[task.name] = steps[-1]
                 record(sid, {
                     "sample_id": sid, "condition": "clean" if attack_name == "clean" else "attacked",
@@ -638,8 +1052,9 @@ def run_curated_matrix(
                     "asr_success": asr, "utility_success": ua,
                     "ua_note": None if task.ua_scorable else "clean evaluator targets a different intent -- UA not scorable",
                     "num_steps": out.get("num_steps"), "attack_generation_time_s": gen_s,
-                    "episode_time_s": ep_s, "peak_cuda_memory_gb": mem["peak_gb"], "error": err, **meta,
-                    **_episode_fields(out),
+                    "episode_time_s": ep_s, "peak_cuda_memory_gb": mem["peak_gb"],
+                    "error": fin_err, **meta, **fin_extra,
+                    "ua_scoring_error": ua_err, **_episode_fields(out, cap_before, task, None),
                 })
                 logger.info("  done: %s (ASR=%s, UA=%s, gen=%s, ep=%.1fs)",
                             sid, asr, ua, f"{gen_s:.1f}s" if gen_s else "n/a", ep_s)
@@ -656,6 +1071,7 @@ def run_curated_matrix(
             # environment's cached clean captions are invalid for this
             # defence and are recomputed; they are cleared again after it.
             blur_def = defense if getattr(defense, "page_level", False) else None
+            _blur_state["def"] = blur_def
             captioner.set_blur(blur_def)
             if blur_def is not None:
                 logger.info("blur %s: cleared %d cached captions", defense_name, clear_caption_cache(env))
@@ -666,8 +1082,14 @@ def run_curated_matrix(
                 sid = f"defended_{defense_name}_{task.name}"
                 if done(sid):
                     logger.info("  skip %s", sid); continue
+                seed_err = _seed_victim(task)
+                if seed_err:
+                    record(sid, {"sample_id": sid, "attack_name": "clean", "defense_name": defense_name,
+                                 "task_id": task.name, "error": seed_err})
+                    continue
                 vwa_task = VWAAdvTask(config_file=task.adv_config,
                                       task_id=task.name, intent=task.intent)
+                cap_before = _cap_counts()
                 t0 = time.perf_counter()
                 with _cuda_memory_guard() as mem:
                     out, err = _run_episode_safely(
@@ -680,9 +1102,10 @@ def run_curated_matrix(
                 out.setdefault("payload_in_prompt", [])
                 ep_s = time.perf_counter() - t0
                 traj = out.get("trajectory")
-                asr = score(task.adv_config, traj) if traj else None
-                ua = score(task.clean_config, traj) if (traj and task.ua_scorable) else None
-                torch.save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                asr = out.get("success") if traj else None
+                ua, ua_err = score(task.clean_config, traj, out.get("final_url")) if (traj and task.ua_scorable) else (None, None)
+                atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                fin_err, fin_extra = _final_error(err, out, ua_err, cap_before, task, sid)
                 record(sid, {
                     "sample_id": sid, "condition": "defended_clean",
                     "attack_name": "clean", "defense_name": defense_name,
@@ -694,7 +1117,8 @@ def run_curated_matrix(
                     "ua_note": None if task.ua_scorable else "clean evaluator targets a different intent -- UA not scorable",
                     "num_steps": out.get("num_steps"), "attack_generation_time_s": None,
                     "episode_time_s": ep_s, "peak_cuda_memory_gb": mem["peak_gb"],
-                    "error": err, **_episode_fields(out),
+                    "error": fin_err, **fin_extra, "ua_scoring_error": ua_err,
+                    **_episode_fields(out, cap_before, task, blur_def),
                 })
                 logger.info("  done: %s (ASR=%s, UA=%s, ep=%.1fs)", sid, asr, ua, ep_s)
 
@@ -720,7 +1144,20 @@ def run_curated_matrix(
                     text, image, meta = cached
                     meta = dict(meta)
                     url = meta.get("victim_url") or task.victim_image_url()
-                    cap, cap_src = _victim_caption(text, image, attack_name, task.name, blur_def)
+                    seed_err = _seed_victim(task)
+                    if seed_err:
+                        record(sid, {"sample_id": sid, "attack_name": attack_name,
+                                     "defense_name": defense_name, "task_id": task.name,
+                                     "error": seed_err})
+                        continue
+                    cap_before = _cap_counts()
+                    cap, cap_src = _victim_caption(text, image, meta, attack_name, task, blur_def)
+                    if cap_src == "caption_failed":
+                        record(sid, {"sample_id": sid, "attack_name": attack_name,
+                                     "defense_name": defense_name, "task_id": task.name,
+                                     "error": f"attack image caption failed: {captioner.last_error}"})
+                        continue
+                    adv_cap_raw = {url: cap} if cap else {}
                     adv_cap = {url: _for_resub(cap)} if cap else {}
                     adv_img = {url: image} if image is not None else {}
                     meta["caption_source"], meta["victim_caption"] = cap_src, cap
@@ -734,13 +1171,14 @@ def run_curated_matrix(
                             instruction_path=str(VWA_ADV_REPO / "agent/prompts/jsons/p_som_cot_id_actree_3s.json"),
                             max_steps=max_steps, adv_url2caption=adv_cap,
                             adv_url2image=adv_img, defense=defense, ecso=ecso_obj,
-                            payload_markers=_markers(adv_cap, meta.get("clean_caption")),
+                            payload_markers=_markers(adv_cap_raw, _clean_caption(task, blur_def)),
                         )
                     ep_s = time.perf_counter() - t0
                     traj = out.get("trajectory")
-                    asr = out.get("success")
-                    ua = score(task.clean_config, traj) if (traj and task.ua_scorable) else None
-                    torch.save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                    asr = out.get("success") if traj else None
+                    ua, ua_err = score(task.clean_config, traj, out.get("final_url")) if (traj and task.ua_scorable) else (None, None)
+                    atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                    fin_err, fin_extra = _final_error(err, out, ua_err, cap_before, task, sid)
                     record(sid, {
                         "sample_id": sid, "condition": "defended_attacked",
                         "attack_name": attack_name, "defense_name": defense_name,
@@ -753,9 +1191,11 @@ def run_curated_matrix(
                         "num_steps": out.get("num_steps"),
                         "attack_generation_time_s": 0.0,  # reused, not regenerated
                         "episode_time_s": ep_s, "peak_cuda_memory_gb": mem["peak_gb"],
-                        "error": err, **meta, **_episode_fields(out),
+                        "error": fin_err, **meta, **fin_extra, "ua_scoring_error": ua_err,
+                        **_episode_fields(out, cap_before, task, blur_def),
                     })
                     logger.info("  done: %s (ASR=%s, UA=%s, ep=%.1fs)", sid, asr, ua, ep_s)
+            _blur_state["def"] = None
             if blur_def is not None:
                 captioner.set_blur(None)
                 clear_caption_cache(env)

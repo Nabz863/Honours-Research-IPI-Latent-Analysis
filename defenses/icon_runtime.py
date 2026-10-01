@@ -294,6 +294,10 @@ def icon_generate(model, inputs: Dict[str, Any], icon: ICONDefense,
 
     info.update({
         "icon_layers_used": layers,
+        # Oracle mode forces the flag; recorded so rectifier-under-oracle
+        # rows are never mistaken for end-to-end ICON (review B18).
+        "icon_oracle": force,
+        "icon_prober_says_attacked": bool(probs.argmax().item() == 1),
         "icon_is_attacked": flagged,
         "icon_confidence": float(probs.max()),
         "icon_fis_per_layer": [float(fis_from_entropy(e).mean()) for e in ents],
