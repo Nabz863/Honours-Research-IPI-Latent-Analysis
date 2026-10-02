@@ -18,3 +18,29 @@ out.txt
 # Analysis outputs ARE committed: small JSON/CSV, and they are what the
 # write-up cites. Tensors and caches inside them stay ignored.
 vwa_adv_stepwise_diagnostic.png
+# outputs and data -- archived separately, never in git
+agentdojo_matrix_*/
+vwa_adv_*/
+attack_matrix_*/
+agentdojo_smoketest_output/
+model_preflight_*/
+smoke_*/
+diag_*/
+SUPERSEDED_*/
+analysis_out/
+logs/
+wandb/
+audit_bundles/
+baselines/*/
+*.pt
+*.pt.weak
+# patch packages and backups
+p1*/
+*_patch.tar.gz
+.p*_backup/
+# environment
+venv/
+__pycache__/
+*.save
+refill.*
+out.txt
