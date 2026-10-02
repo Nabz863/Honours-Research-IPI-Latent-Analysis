@@ -288,11 +288,40 @@ def _parse_gemma_native_at(raw: str, start: int) -> Optional["FunctionCall"]:
         except ValueError:
             return tok
 
+    def parse_plain_string(q):
+        # Gemma 4 does not always use its special <|"|> delimiter: in
+        # AgentDojo it often writes ordinary quotes, query: "Networking
+        # event". Read as a bare token, the quotes stayed IN the value, so
+        # every search ran for the literal string '"Networking event"',
+        # found nothing, and every episode looped to the turn limit with
+        # 0/80 clean utility (diagnostic job 62469, 2 Oct). Reads up to the
+        # matching unescaped quote, so commas inside the string are kept.
+        j = pos[0] + 1
+        while j < len(s):
+            if s[j] == "\\":
+                j += 2
+                continue
+            if s[j] == q:
+                break
+            j += 1
+        if j >= len(s):
+            raise ValueError("unterminated quoted string")
+        body = s[pos[0] + 1:j]
+        pos[0] = j + 1
+        if q == '"':
+            try:
+                return json.loads('"' + body + '"')
+            except ValueError:
+                return body
+        return body
+
     def parse_value():
         skip_ws()
         if s.startswith(_GEMMA_Q, pos[0]):
             return parse_string()
         c = peek()
+        if c in ('"', "'"):
+            return parse_plain_string(c)
         if c == "{":
             return parse_object()
         if c == "[":
