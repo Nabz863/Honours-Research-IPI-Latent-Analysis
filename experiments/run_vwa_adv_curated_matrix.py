@@ -354,7 +354,7 @@ def run_curated_matrix(
         "model_id": model_id, "site": site, "max_steps": max_steps,
         "strict_asr_dir_sha": dir_sha(os.environ.get("STRICT_ASR_CONFIG_DIR")),
         "clean_ua_dir_sha": dir_sha(os.environ.get("CLEAN_UA_CONFIG_DIR")),
-        "captioner": {"prompt": CAPTION_PROMPT, "max_side": MAX_SIDE, "max_new_tokens": 64},
+        "captioner": {"prompt": CAPTION_PROMPT, "max_side": MAX_SIDE, "max_new_tokens": 128},
         # Inputs outside this repo that change what an episode is (review 4,
         # M4): the agent prompt, visualwebarena's environment and evaluator
         # code, and agent-attack's task data for the selected tasks.
@@ -404,7 +404,9 @@ def run_curated_matrix(
 
     # SELF-CAPTIONING (decision 30 Sep): the agent model captions every page
     # image, as in the VWA-Adv paper's self-captioning configuration.
-    captioner = SelfCaptioner(model, processor, max_new_tokens=64, extractor=extractor)
+    # 128 tokens (P1.4, 3 Oct; was 64): both models ignore "short" and write
+    # long descriptions, and 64 tokens cut them mid-word in the smoke runs.
+    captioner = SelfCaptioner(model, processor, max_new_tokens=128, extractor=extractor)
     env = ScriptBrowserEnv(headless=True, observation_type="image_som",
                            current_viewport_only=False, viewport_size={"width": 1280, "height": 2048},
                            captioning_fn=captioner)
