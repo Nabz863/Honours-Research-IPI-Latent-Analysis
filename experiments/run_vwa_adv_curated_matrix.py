@@ -869,20 +869,16 @@ def run_curated_matrix(
                 if done(sid):
                     logger.info("  skip %s", sid); continue
 
-                # Playwright's sync API refuses to start while an event loop
-                # is running. A browser failure earlier in this process leaves
-                # exactly that state behind, and every remaining episode would
-                # fail identically at ~11s each. Test the real condition
-                # rather than matching error text.
-                import asyncio as _asyncio
-                try:
-                    _asyncio.get_running_loop()
-                except RuntimeError:
-                    pass
-                else:
-                    _abort("Playwright's event loop is still running -- an "
-                           "earlier browser failure poisoned this process; no "
-                           "further episode can succeed", sid)
+                # REMOVED (P1.3, 3 Oct): a check that aborted the run whenever
+                # asyncio.get_running_loop() succeeded. Playwright's SYNC API
+                # runs its event loop in a separate greenlet on the same
+                # thread, and asyncio's "running loop" is per thread, so after
+                # the browser's first start the check fires on EVERY later
+                # episode: smoke jobs 62671/62673 each completed one episode
+                # and then aborted with no error row. The condition it meant to
+                # catch -- a browser failure that leaves Playwright unable to
+                # restart -- surfaces as an episode error containing "asyncio
+                # loop", which _FATAL_ERROR_MARKERS already treats as terminal.
 
                 _blur_state["def"] = None
                 seed_err = _seed_victim(task)
