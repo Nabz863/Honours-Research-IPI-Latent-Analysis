@@ -83,12 +83,23 @@ from experiments.code_version import (code_version, check_resume_compatible, att
                                       dir_sha, files_sha, spotlight_seed_sha, write_manifest)
 from experiments.episode_utils import (_cuda_memory_guard, _run_episode_safely, _build_defense_registry,
                                        atomic_write_json, atomic_write_text, atomic_torch_save,
-                                       atomic_save_image)
+                                       atomic_save_image, atomic_write_json_gz)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"url:\s*(\S+?)\]?$")
+
+
+def _model_short(model_id: str) -> str:
+    """The short model name the AgentDojo runner uses (--model), so both
+    runners find the same ICON prober file."""
+    m = model_id.lower()
+    for key, short in (("qwen3", "qwen3vl"), ("qwen2", "qwen2vl"), ("gemma", "gemma4"),
+                       ("internvl", "internvl"), ("llava", "llava")):
+        if key in m:
+            return short
+    return re.sub(r"[^a-z0-9]+", "_", m)
 
 
 class _ReusePayload(Exception):
@@ -176,7 +187,7 @@ class CuratedTask:
         return None
 
 
-def _build_registry(model, processor, extractor=None) -> Dict[str, BaseAttack]:
+def _build_registry(model, processor, extractor=None, obf_layer: Optional[int] = None) -> Dict[str, BaseAttack]:
     return {
         "template_ipi": TemplateIPIAttack(),
         "gcg": GCGAttack(model, processor),
@@ -193,7 +204,11 @@ def _build_registry(model, processor, extractor=None) -> Dict[str, BaseAttack]:
         # per task, taken from that task's OWN clean episode -- cached
         # below during the clean pass, exactly as run_attack_matrix.py
         # does via clean_activations_by_task.
-        "obfuscated_activation": ObfuscatedActivationAttack(model, processor, extractor),
+        # target_layer EXPLICIT (review P2a-B1): its default is the extractor's
+        # first layer, which all-layer capture made layer 0, while the clean
+        # reference is taken from the middle of the analysis band.
+        "obfuscated_activation": ObfuscatedActivationAttack(model, processor, extractor,
+                                                            target_layer=obf_layer),
         # The paper's own adversarial images, captioned by OUR model in the
         # episode: transfer attacks, paper-comparable (self-captioning).
         "bim_caption_transfer": ShippedImageAttack("bim_caption_transfer", "bim_caption"),
@@ -245,7 +260,14 @@ def run_curated_matrix(
     max_tasks: Optional[int] = None, max_steps: int = 15,
     only_tasks: Optional[List[str]] = None,
     defense_names: Optional[List[str]] = None,
+    capture_layers: Optional[List[int]] = None,
+    capture: bool = False,
 ) -> None:
+    """target_layers is the ANALYSIS band (obfuscated activation's default
+    layer); capture_layers is what every step saves -- all layers in the
+    final runs (P2a). capture=True also writes the images given to the model
+    at every generation (qualitative figures; re-runs into a separate
+    directory)."""
     from browser_env import ScriptBrowserEnv
     from evaluation_harness import evaluator_router
     from environments.vwa_adv_tasks import VWAAdvTask, run_vwa_adv_episode
@@ -280,8 +302,10 @@ def run_curated_matrix(
         # of zero episodes (review 3, #4).
         raise SystemExit(f"FATAL: no tasks selected (site={site!r}, only_tasks={only_tasks})")
 
-    extractor = ActivationExtractor(model, target_layers=target_layers, token_aggregation="last")
-    registry = _build_registry(model, processor, extractor)
+    capture_layers = list(capture_layers) if capture_layers is not None else list(target_layers)
+    extractor = ActivationExtractor(model, target_layers=capture_layers, token_aggregation="last")
+    _obf_layer = target_layers[len(target_layers) // 2]          # middle of the analysis band
+    registry = _build_registry(model, processor, extractor, obf_layer=_obf_layer)
 
     # (attack_name, task_name) -> (adv_cap, adv_img, meta). Populated by
     # the undefended attack loop and reused by every defended pass. The
@@ -338,23 +362,54 @@ def run_curated_matrix(
         defense_registry = {**_build_defense_registry(),
                             **build_visual_defense_registry()}
         ecso_registry = build_ecso_registry()
+        if "attention_tracker" in defense_names:
+            # The model is its own detector (D4, P2a); heads and threshold from
+            # synthetic calibration data, persisted with this directory.
+            from defenses.attention_tracker import AttentionTrackerDefense, load_or_calibrate
+            _at_cal = load_or_calibrate(model, processor, output_dir / "attention_tracker_calibration.json")
+            defense_registry["attention_tracker"] = AttentionTrackerDefense(model, processor, _at_cal)
         for d in defense_names:
+            if d == "icon":
+                continue
             if d not in defense_registry and d not in ecso_registry:
                 raise KeyError(
                     f"Unknown defense {d!r} -- have "
-                    f"{sorted(set(defense_registry) | set(ecso_registry))}")
+                    f"{sorted(set(defense_registry) | set(ecso_registry) | {'icon'})}")
+    # ICON (P2a, decision 3 Oct: kept on both benchmarks). Not a content
+    # transformation: it rides icon=, never defense= (whose apply() is a
+    # no-op for it). Oracle mode, ICON_ORACLE_ATTACKED=1, is the rectifier
+    # under oracle detection; otherwise a trained prober with its layer set.
+    icon_obj = None
+    _icon_oracle = os.environ.get("ICON_ORACLE_ATTACKED") == "1"
+    _icon_prober_path = PROJECT_ROOT / f"defenses/icon_prober_{_model_short(model_id)}.pt"
+    if defense_names and "icon" in defense_names:
+        from defenses.icon import ICONDefense
+        from defenses.icon_runtime import load_prober_checkpoint
+        icon_obj = ICONDefense()
+        if _icon_oracle:
+            logger.warning("ICON: ORACLE mode -- every episode treated as attacked. Report as "
+                           "rectifier-under-oracle-detection, NOT end-to-end ICON.")
+        else:
+            icon_obj.prober, icon_obj.layer_indices = load_prober_checkpoint(str(_icon_prober_path))
     for n in attack_names:
         if n not in registry:
             raise KeyError(f"Unknown attack {n!r} -- have {sorted(registry)}")
 
     # Per-attack code hashes, run settings and defence configuration,
     # stamped on rows and checked on resume (review 3, #3, #4, #13).
-    _ATK_SHA = {n: attack_code_sha(registry[n]) for n in attack_names}
+    _ATK_SHA = {n: attack_code_sha(registry[n], {"target_layer": registry[n].target_layer,
+                                                 "num_steps": registry[n].num_steps,
+                                                 "candidates_per_step": registry[n].candidates_per_step}
+                                   if n == "obfuscated_activation" else None)
+                for n in attack_names}
     _RUN_SETTINGS = {
         "model_id": model_id, "site": site, "max_steps": max_steps,
         "strict_asr_dir_sha": dir_sha(os.environ.get("STRICT_ASR_CONFIG_DIR")),
         "clean_ua_dir_sha": dir_sha(os.environ.get("CLEAN_UA_CONFIG_DIR")),
         "captioner": {"prompt": CAPTION_PROMPT, "max_side": MAX_SIDE, "max_new_tokens": 128},
+        # what each step's activation entry holds (P2a: every layer)
+        "capture_layers": capture_layers,
+        "model_dtype": str(next(model.parameters()).dtype),
         # Inputs outside this repo that change what an episode is (review 4,
         # M4): the agent prompt, visualwebarena's environment and evaluator
         # code, and agent-attack's task data for the selected tasks.
@@ -373,6 +428,12 @@ def run_curated_matrix(
             base=exp_data),
     }
     _DEF_SHA = {d: spotlight_seed_sha() for d in (defense_names or []) if d.startswith("spotlighting")}
+    if defense_names and "attention_tracker" in defense_names:
+        import hashlib as _hl
+        _DEF_SHA["attention_tracker"] = _hl.sha256(json.dumps(_at_cal, sort_keys=True).encode()).hexdigest()
+    if icon_obj is not None:
+        from experiments.code_version import file_sha as _file_sha
+        _DEF_SHA["icon"] = "oracle" if _icon_oracle else _file_sha(str(_icon_prober_path))
 
     # Transfer attacks need agent-attack's shipped images; say up front how
     # many tasks have them (review 3, #8).
@@ -772,6 +833,18 @@ def run_curated_matrix(
                 out.append(c[:60])
         return out
 
+    def _detection_fields(out):
+        """Attention Tracker: how many distinct texts it checked and flagged
+        in this episode -- page observations AND the page-derived element
+        text in PREVIOUS ACTION, which is defended too -- and their scores."""
+        det = [r for r in (out.get("defense_results") or []) if "detected" in r]
+        if not det:
+            return {}
+        return {"defense_detections": sum(1 for r in det if r.get("detected")),
+                "defense_checked": sum(1 for r in det if r.get("focus_score") is not None),
+                "defense_skipped": sum(1 for r in det if r.get("skipped") and r.get("skipped") != "empty"),
+                "defense_scores": [round(float(r["focus_score"]), 6) for r in det if r.get("focus_score") is not None]}
+
     def _episode_fields(out, cap_before=None, task=None, blur_def=None):
         """Per-row diagnostics that used to be computed and discarded
         (audit 11.4, 11.9, 11.11), plus this episode's captioner activity."""
@@ -796,6 +869,9 @@ def run_curated_matrix(
             "retries_deduplicated": out.get("retries_deduplicated"),
             "payload_in_prompt": pip,
             "payload_reached": (any(pip) if pip else None),
+            "icon_info": out.get("icon_info") or [],
+            "capture": bool(capture),
+            **_detection_fields(out),
         }
 
     _MAX_SCORING_ATTEMPTS = 3
@@ -845,6 +921,26 @@ def run_curated_matrix(
 
     def _cap_counts():
         return (captioner.n_images, captioner.n_failures, captioner.n_calls_while_hooked, captioner.n_oom)
+
+    def _save_episode(sid, out):
+        """Activations and the per-step transcript, before the row (P2a)."""
+        atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+        tp = output_dir / f"{sid}.transcript.json.gz"
+        if out.get("transcript") is not None:
+            atomic_write_json_gz(tp, out["transcript"])
+        elif tp.exists():
+            tp.unlink()          # never leave an earlier attempt's transcript beside this row
+
+    def _capture_dir(sid):
+        """Capture mode: a fresh directory per episode attempt, so a retry
+        with fewer steps leaves no images from the earlier attempt."""
+        if not capture:
+            return None
+        d = output_dir / "capture" / sid
+        if d.exists():
+            import shutil
+            shutil.rmtree(d)
+        return str(d)
 
     def score(config_path: Path, trajectory, final_url: Optional[str] = None):
         """Scores a finished episode against a config's evaluator. Returns
@@ -925,7 +1021,7 @@ def run_curated_matrix(
                     _ref_act = None
                     if attack_name == "obfuscated_activation" and cached_payload is None:
                         _ref = _clean_ref(task)
-                        _layer = target_layers[len(target_layers) // 2]
+                        _layer = registry["obfuscated_activation"].target_layer
                         if not _ref or _layer not in _ref:
                             record(sid, {"sample_id": sid, "attack_name": attack_name,
                                          "task_id": task.name,
@@ -1018,6 +1114,7 @@ def run_curated_matrix(
                         instruction_path=str(VWA_ADV_REPO / "agent/prompts/jsons/p_som_cot_id_actree_3s.json"),
                         max_steps=max_steps, adv_url2caption=adv_cap, adv_url2image=adv_img,
                         payload_markers=_markers(adv_cap_raw, _clean_caption(task, None)),
+                        capture_dir=_capture_dir(sid),
                     )
                 ep_s = time.perf_counter() - t0
 
@@ -1028,7 +1125,7 @@ def run_curated_matrix(
                 asr = out.get("success") if traj else None
                 ua, ua_err = score(task.clean_config, traj, out.get("final_url")) if (traj and task.ua_scorable) else (None, None)
 
-                atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                _save_episode(sid, out)
                 fin_err, fin_extra = _final_error(err, out, ua_err, cap_before, task, sid)
                 if attack_name == "clean":
                     # obfuscated_activation optimises its suffix to keep the
@@ -1095,14 +1192,15 @@ def run_curated_matrix(
                         model_id, vwa_task, env,
                         instruction_path=str(VWA_ADV_REPO / "agent/prompts/jsons/p_som_cot_id_actree_3s.json"),
                         max_steps=max_steps, adv_url2caption={}, adv_url2image={},
-                        defense=defense, ecso=ecso_obj,
+                        defense=defense, ecso=ecso_obj, icon=icon_obj if defense_name == "icon" else None,
+                        capture_dir=_capture_dir(sid),
                     )
                 out.setdefault("payload_in_prompt", [])
                 ep_s = time.perf_counter() - t0
                 traj = out.get("trajectory")
                 asr = out.get("success") if traj else None
                 ua, ua_err = score(task.clean_config, traj, out.get("final_url")) if (traj and task.ua_scorable) else (None, None)
-                atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                _save_episode(sid, out)
                 fin_err, fin_extra = _final_error(err, out, ua_err, cap_before, task, sid)
                 record(sid, {
                     "sample_id": sid, "condition": "defended_clean",
@@ -1169,13 +1267,15 @@ def run_curated_matrix(
                             instruction_path=str(VWA_ADV_REPO / "agent/prompts/jsons/p_som_cot_id_actree_3s.json"),
                             max_steps=max_steps, adv_url2caption=adv_cap,
                             adv_url2image=adv_img, defense=defense, ecso=ecso_obj,
+                            icon=icon_obj if defense_name == "icon" else None,
                             payload_markers=_markers(adv_cap_raw, _clean_caption(task, blur_def)),
+                            capture_dir=_capture_dir(sid),
                         )
                     ep_s = time.perf_counter() - t0
                     traj = out.get("trajectory")
                     asr = out.get("success") if traj else None
                     ua, ua_err = score(task.clean_config, traj, out.get("final_url")) if (traj and task.ua_scorable) else (None, None)
-                    atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
+                    _save_episode(sid, out)
                     fin_err, fin_extra = _final_error(err, out, ua_err, cap_before, task, sid)
                     record(sid, {
                         "sample_id": sid, "condition": "defended_attacked",
@@ -1221,9 +1321,18 @@ if __name__ == "__main__":
     ap.add_argument("--max_steps", type=int, default=15)
     ap.add_argument("--defense_names", type=str, nargs="*", default=None,
                     help="spotlighting_delimiting spotlighting_datamarking "
-                         "spotlighting_encoding; runs defended-clean AND "
+                         "spotlighting_encoding gaussian_blur_sigma<s> ecso attention_tracker icon "
+                         "(ICON_ORACLE_ATTACKED=1 for oracle mode); runs defended-clean AND "
                          "defended-attacked passes per defence")
     ap.add_argument("--output_dir", type=str, default="vwa_adv_curated")
+    ap.add_argument("--capture", action="store_true",
+                    help="also write the images given to the model at every generation "
+                         "(qualitative figures). Re-run chosen episodes into a SEPARATE "
+                         "output directory, first copying the original directory's "
+                         "payloads/, captions.json and attention_tracker_calibration.json "
+                         "into it, so the re-run sees the same payloads, captions and "
+                         "detector; each re-run must then reproduce its original row "
+                         "(compare the transcripts' prompt_sha256 and image_sha256).")
     a = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -1260,9 +1369,11 @@ if __name__ == "__main__":
         model, processor = VLMLoader(LoadConfig(
             model_id=a.model_id, device_map="auto",
             attn_implementation="eager")).load()
+    from extraction.hooks import all_layers
     run_curated_matrix(model, processor, a.model_id, a.attack_names,
                        _resolve_target_layers(model, None), Path(a.output_dir),
                        Path(a.exp_data), a.site, a.max_tasks, a.max_steps,
                        only_tasks=a.only_tasks,
-                       defense_names=a.defense_names)
+                       defense_names=a.defense_names,
+                       capture_layers=all_layers(model), capture=a.capture)
     print(f"Done. See {a.output_dir}/attack_results.json")

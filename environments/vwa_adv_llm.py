@@ -82,6 +82,10 @@ that needs postmill.sif confirmed working on the cluster first.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import re
@@ -274,12 +278,29 @@ class LocalVLMBackend:
 
     def __init__(self, model: Any, processor: Any, extractor: Any, max_new_tokens: int = 512,
                  defense: Any = None, ecso: Any = None, task_intent: Optional[str] = None,
-                 payload_markers: Optional[List[str]] = None):
+                 payload_markers: Optional[List[str]] = None, icon: Any = None,
+                 capture_dir: Optional[str] = None):
         self.model = model
         self.processor = processor
         self.extractor = extractor
         self.max_new_tokens = max_new_tokens
         self.step_activations: List[Dict[int, torch.Tensor]] = []
+        # ICON (P2a): probe attention over a short generation, then generate
+        # under the Mitigating Rectifier when flagged -- the same flow as the
+        # AgentDojo element. One info dict per agent step.
+        self.icon = icon
+        self.icon_info: List[Dict[str, Any]] = []
+        # Per-step text (P2a). Each agent decision records the observation as
+        # the model saw it (after any defence), the undefended one, every
+        # generation the decision took (ECSO takes up to four) and the
+        # response. Message de-duplication as in agentdojo_llm.
+        from environments.agentdojo_llm import TranscriptRecorder
+        self.transcript = TranscriptRecorder()
+        self._calls: List[Dict[str, Any]] = []
+        # Capture mode (off by default): the images EXACTLY as given to the
+        # model at every generation (the screenshot after any image defence),
+        # written as PNGs, for figures and for replaying a decision.
+        self.capture_dir = Path(capture_dir) if capture_dir else None
         # DEFENSE SCOPE, and how it differs from AgentDojo's.
         # In AgentDojo the untrusted channel is cleanly delimited: only
         # role="tool" messages carry retrieved content, so the defense
@@ -336,6 +357,8 @@ class LocalVLMBackend:
 
         conversation = prompt["conversation"]
         images = prompt["images"]
+        raw_conversation = conversation
+        self._calls = []
 
         if self.payload_markers:
             raw_text = " ".join(
@@ -371,6 +394,14 @@ class LocalVLMBackend:
             out = self._ecso_generate(conversation, images)
         else:
             out = self._raw_generate(conversation, images)
+        self.transcript.add(
+            step=len(self.transcript.steps),
+            raw_input=self.transcript.ids(raw_conversation),
+            calls=self._calls,
+            response=out,
+            ecso=(self.ecso_info[-1] if getattr(self, "ecso", None) is not None and self.ecso_info else None),
+            icon=(self.icon_info[-1] if self.icon is not None and self.icon_info else None),
+        )
         self._last_prompt, self._last_response = prompt, out
         return out
 
@@ -397,8 +428,26 @@ class LocalVLMBackend:
             from environments.agentdojo_llm import _has_double_bos
             self.double_bos = _has_double_bos(self.processor, inputs["input_ids"])
 
+        image_files = self._capture_images(images)
+
+        # ICON: detection pass OUTSIDE the extractor (capture_step='first'
+        # would otherwise keep the detection pass's activations), then the
+        # agent's generation, rectified when flagged.
+        rectify = False
+        if self.icon is not None:
+            from defenses.icon_runtime import icon_detect
+            info = icon_detect(self.model, inputs, self.icon, detect_tokens=32)
+            rectify = bool(info.get("icon_is_attacked"))
+            info["icon_rectified"] = rectify
+            self.icon_info.append(info)
+        if rectify:
+            from defenses.icon_runtime import _rectifying
+            ctx = _rectifying(self.icon.rectifier, self.model)
+        else:
+            ctx = contextlib.nullcontext()
+
         with self.extractor:
-            with torch.no_grad():
+            with torch.no_grad(), ctx:
                 output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, temperature=None, top_p=None, top_k=None)
             # Snapshot THIS step's activations before the next generate()
             # call would overwrite them, then clear for the next step.
@@ -424,7 +473,32 @@ class LocalVLMBackend:
         # that specific parser is equally vulnerable to a prompt-
         # contaminated completion, but there's no reason to find out the
         # hard way when the fix is this direct and already proven.
-        return self.processor.decode(output_ids[0][input_length:], skip_special_tokens=True).strip()
+        completion = self.processor.decode(output_ids[0][input_length:], skip_special_tokens=True).strip()
+        self._calls.append({
+            "input": self.transcript.ids(conversation),
+            # identifies the images given to the model even without capture
+            # mode, so a capture re-run can be checked against the original
+            "image_sha256": [hashlib.sha256(im.tobytes()).hexdigest()[:16] for im in (images or [])],
+            "prompt_sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(),
+            "n_input_tokens": int(input_length), "max_new_tokens": int(max_new_tokens),
+            "n_images": len(images or []), "image_files": image_files,
+            "completion": completion,
+        })
+        return completion
+
+    def _capture_images(self, images) -> Optional[List[str]]:
+        """Capture mode only: write this generation's images as given to the
+        model. Names are step/call indices, so a retried episode overwrites
+        its own files."""
+        if self.capture_dir is None or not images:
+            return None
+        from experiments.episode_utils import atomic_save_image
+        names = []
+        for j, im in enumerate(images):
+            name = f"step{len(self.transcript.steps):02d}_call{len(self._calls)}_img{j}.png"
+            atomic_save_image(im, self.capture_dir / name)
+            names.append(name)
+        return names
 
     def _ecso_generate(self, conversation, images) -> str:
         """ECSO replaces generation rather than transforming content, so
@@ -598,6 +672,8 @@ def construct_local_vlm_agent(
     ecso: Any = None,
     task_intent: Optional[str] = None,
     payload_markers: Optional[List[str]] = None,
+    icon: Any = None,
+    capture_dir: Optional[str] = None,
 ):
     """
     Builds and registers everything needed for one (model, task) run:
@@ -637,7 +713,8 @@ def construct_local_vlm_agent(
     backend = LocalVLMBackend(model, processor, extractor,
                               max_new_tokens=max_new_tokens, defense=defense,
                               ecso=ecso, task_intent=task_intent,
-                              payload_markers=payload_markers)
+                              payload_markers=payload_markers, icon=icon,
+                              capture_dir=capture_dir)
 
     register_local_vlm_backend(model_id, backend)
     install_local_vlm_provider()

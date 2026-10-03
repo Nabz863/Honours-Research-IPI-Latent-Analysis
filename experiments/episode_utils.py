@@ -67,6 +67,14 @@ def atomic_write_json(path, obj, **kw) -> None:
     atomic_write_text(path, json.dumps(obj, **kw))
 
 
+def atomic_write_json_gz(path, obj) -> None:
+    """gzip-compressed JSON (per-step transcripts, P2a). mtime=0 so the same
+    transcript always produces the same bytes."""
+    import gzip
+    data = gzip.compress(json.dumps(obj, default=str).encode("utf-8"), compresslevel=6, mtime=0)
+    _atomic(path, lambda f: f.write(data))
+
+
 def atomic_torch_save(obj, path) -> None:
     _atomic(path, lambda f: torch.save(obj, f))
 

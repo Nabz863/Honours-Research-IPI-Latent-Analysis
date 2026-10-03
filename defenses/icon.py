@@ -330,14 +330,23 @@ class MitigatingRectifier:
         reproduce the original exactly. If it does not, this raises
         rather than evaluating attacks through subtly wrong attention.
         """
-        from defenses.icon_runtime import find_attention_module
+        from defenses.icon_runtime import find_attention_module, text_attention_ids
         mod = find_attention_module(model)
         base = getattr(mod, "eager_attention_forward")
         rectifier = self
         checked = {"done": False}
+        # Steer only the language model's decoder attention: in the Qwen-VL
+        # files the vision tower calls the same eager_attention_forward, and
+        # its blocks carry layer indices of their own (P2a).
+        scope = text_attention_ids(model)
 
         def steered(module, query, key, value, attention_mask=None,
                     scaling=None, dropout=0.0, **kwargs):
+            if id(module) not in scope:
+                # not a decoder attention (e.g. the vision tower): the model's
+                # own function, untouched
+                return base(module, query, key, value, attention_mask,
+                            scaling=scaling, dropout=dropout, **kwargs)
             if scaling is None:
                 scaling = query.shape[-1] ** -0.5
             n_rep = query.shape[1] // key.shape[1] if key.shape[1] else 1
@@ -350,8 +359,12 @@ class MitigatingRectifier:
 
             if not checked["done"]:
                 checked["done"] = True
+                # scaling and dropout BY NAME: their positional order differs
+                # between model files (Gemma 4: mask, dropout, scaling), and
+                # passing scaling positionally raised "multiple values for
+                # argument 'dropout'" there (P2a, tiny-Gemma test)
                 ref_out, _ = base(module, query, key, value, attention_mask,
-                                  scaling, dropout=dropout, **kwargs)
+                                  scaling=scaling, dropout=dropout, **kwargs)
                 sc = scores
                 if attention_mask is not None:
                     sc = sc + attention_mask[:, :, :, : k.shape[-2]]

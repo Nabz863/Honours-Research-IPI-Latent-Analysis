@@ -26,9 +26,9 @@ Supported models
 
 HPC notes
 ---------
-  - fp16 by default; switch to 4-bit quantisation via load_in_4bit=True
-    if VRAM is < 24 GB (note: 4-bit alters residual stream precision —
-    flag any results obtained under quantisation).
+  - bf16 for every model (audit 14.1, P2a: LLaVA-NeXT was the last one on
+    fp16). 4-bit quantisation (load_in_4bit=True) alters residual-stream
+    precision -- flag any result obtained under it.
   - device_map="auto" distributes across available GPUs automatically.
   - CPU fallback included for local dev / unit tests.
 """
@@ -73,7 +73,7 @@ class LoadConfig:
     load_in_8bit : bool
         Use BitsAndBytes 8-bit quantisation. Better precision than 4-bit.
     dtype : torch.dtype
-        Weight dtype when not quantising. fp16 recommended for HPC.
+        Weight dtype when not quantising. bf16 for every model (14.1).
     device_map : str | dict
         Passed to from_pretrained. "auto" = distribute across GPUs.
     max_memory : dict | None
@@ -84,7 +84,7 @@ class LoadConfig:
     model_id: str
     load_in_4bit: bool = False
     load_in_8bit: bool = False
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.bfloat16
     device_map: Any = "auto"
     max_memory: Optional[Dict] = None
     attn_implementation: str = "eager"
@@ -172,7 +172,7 @@ class VLMLoader:
         if self.config.load_in_4bit:
             return BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
@@ -299,9 +299,12 @@ class VLMLoader:
 # ---------------------------------------------------------------------------
 
 def load_llavanext_7b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
+    """bf16, like every other loader (audit 14.1, P2a). It was fp16, which
+    has a fraction of bf16's dynamic range: a precision difference between
+    models is a confound for any cross-model geometric comparison."""
     cfg = LoadConfig(
         model_id="llava-hf/llava-v1.6-mistral-7b-hf",
-        dtype=torch.float16 if hpc else torch.float32,
+        dtype=torch.bfloat16 if hpc else torch.float32,
         device_map="auto" if hpc else "cpu",
         attn_implementation="eager",
     )
@@ -311,7 +314,7 @@ def load_llavanext_7b(hpc: bool = True) -> Tuple[torch.nn.Module, Any]:
 def load_llavanext_13b(hpc: bool = True, quantise: bool = False) -> Tuple[torch.nn.Module, Any]:
     cfg = LoadConfig(
         model_id="llava-hf/llava-v1.6-vicuna-13b-hf",
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device_map="auto" if hpc else "cpu",
         load_in_4bit=quantise,
         attn_implementation="eager",

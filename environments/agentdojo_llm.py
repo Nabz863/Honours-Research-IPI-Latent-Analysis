@@ -73,6 +73,8 @@ state across different episodes/tasks -- only across turns within one.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -542,6 +544,50 @@ def _apply_defense_to_tool_messages(
     return patched, addenda
 
 
+class TranscriptRecorder:
+    """Per-step text of one episode, de-duplicated (P2a, qualitative figures).
+
+    Each step stores the conversation EXACTLY as given to the chat template
+    (after any defence) and the undefended one, as lists of ids into a shared
+    message table: the history repeats from step to step, so each distinct
+    message is stored once. The prompt for step t is
+    processor.apply_chat_template([messages[i] for i in steps[t]["input"]],
+    add_generation_prompt=True, tokenize=False), and prompt_sha256 checks a
+    replay against what actually ran."""
+
+    def __init__(self):
+        self.messages: List[Any] = []
+        self._index: Dict[str, int] = {}
+        self.steps: List[Dict[str, Any]] = []
+
+    def ids(self, items: Sequence[Any]) -> List[int]:
+        out = []
+        for m in items:
+            k = json.dumps(m, sort_keys=True, default=str)
+            if k not in self._index:
+                self._index[k] = len(self.messages)
+                self.messages.append(json.loads(k))
+            out.append(self._index[k])
+        return out
+
+    def add(self, **step: Any) -> None:
+        self.steps.append(step)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {"format": 1, "messages": self.messages, "steps": self.steps}
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _full_tool_call(fc: "FunctionCall") -> Dict[str, Any]:
+    """A tool call, untruncated and JSON-safe (the row keeps a truncated
+    summary; the transcript keeps the whole call)."""
+    return json.loads(json.dumps({"function": getattr(fc, "function", None),
+                                  "args": dict(getattr(fc, "args", {}) or {})}, default=str))
+
+
 class LocalVLMPipelineElement(BasePipelineElement):
     """
     AgentDojo pipeline element that calls a LOCALLY loaded model
@@ -621,6 +667,7 @@ class LocalVLMPipelineElement(BasePipelineElement):
         self.turn_activations: List[Dict[int, torch.Tensor]] = []
         self.turn_tool_calls: List[List[Dict[str, Any]]] = []
         self.turn_raw_completions: List[str] = []
+        self.transcript = TranscriptRecorder()
 
     def _stop_kwargs(self) -> Dict[str, Any]:
         """Stop at the end of the first tool call, as the prompt instructs
@@ -651,6 +698,7 @@ class LocalVLMPipelineElement(BasePipelineElement):
         tools = list(runtime.functions.values()) if runtime is not None else []
 
         defense_addenda: List[str] = []
+        raw_messages = messages
         if self.defense is not None:
             messages, defense_addenda = _apply_defense_to_tool_messages(
                 messages, self.defense, self._defense_cache
@@ -674,6 +722,19 @@ class LocalVLMPipelineElement(BasePipelineElement):
         prompt = self.processor.apply_chat_template(
             conversation, add_generation_prompt=True, tokenize=False
         )
+        if self.defense is not None:
+            # the same turn as the model would have seen it undefended
+            raw_patched, _sys_done = [], False
+            for m in raw_messages:
+                if m["role"] == "system" and not _sys_done:
+                    raw_patched.append({"role": "system", "content": [{"content": _make_system_prompt(
+                        _block_text(m.get("content")), tools)}]})
+                    _sys_done = True
+                else:
+                    raw_patched.append(m)
+            raw_conversation = _build_conversation(raw_patched)
+        else:
+            raw_conversation = conversation
 
         device = next(self.model.parameters()).device
         inputs = self.processor(text=prompt, return_tensors="pt")
@@ -683,36 +744,32 @@ class LocalVLMPipelineElement(BasePipelineElement):
             self.double_bos = _has_double_bos(self.processor, inputs["input_ids"])
 
         icon_info: Dict[str, Any] = {}
+        rectify = False
         if self.icon is not None:
-            from defenses.icon_runtime import record_features, icon_generate
+            from defenses.icon_runtime import record_layer_stats, icon_detect, _rectifying
             if self.icon_record_only:
-                # Calibration: one short recording pass to build the
-                # prober's training set. No defense applied.
-                z, layers = record_features(
-                    self.model, inputs, top_k_layers=self.icon.top_k_layers)
-                self.turn_icon_features.append(z.cpu())
-                icon_info = {"icon_layers_used": layers, "icon_record_only": True}
+                # Calibration: one short recording pass, statistics of EVERY
+                # layer; calibrate_icon.py chooses the prober's layers once
+                # (review B9). No defense applied.
+                self.turn_icon_features.append(record_layer_stats(self.model, inputs))
+                icon_info = {"icon_record_only": True}
             else:
                 # Detection runs OUTSIDE the extractor on purpose:
                 # capture_step='first' records only the first forward per
                 # register/clear cycle, so running both passes inside would
                 # capture the DETECTION pass and discard the activations of
-                # the rectified generation RQ2 actually needs.
-                _, icon_info = icon_generate(
-                    self.model, inputs, self.icon,
-                    max_new_tokens=1, detect_tokens=32)
+                # the generation the agent acts on.
+                icon_info = icon_detect(self.model, inputs, self.icon, detect_tokens=32)
+                rectify = bool(icon_info.get("icon_is_attacked"))
 
         with self.extractor:
             with torch.no_grad():
-                if self.icon is not None and not self.icon_record_only \
-                        and icon_info.get("icon_is_attacked"):
-                    from defenses.icon_runtime import _rectifying
-                    with _rectifying(self.icon.rectifier, self.model):
-                        output_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False, temperature=None, top_p=None, top_k=None, **self._stop_kwargs())
-                    icon_info["icon_rectified"] = True
-                else:
+                ctx = (_rectifying(self.icon.rectifier, self.model) if rectify
+                       else contextlib.nullcontext())
+                with ctx:
                     output_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False, temperature=None, top_p=None, top_k=None, **self._stop_kwargs())
-                    icon_info.setdefault("icon_rectified", False)
+                if self.icon is not None:
+                    icon_info["icon_rectified"] = rectify
             # Snapshot THIS turn's activations before the next query() call
             # would overwrite them, then clear for the next turn. This MUST
             # stay inside `with self.extractor:` -- get_activations() reads
@@ -757,6 +814,17 @@ class LocalVLMPipelineElement(BasePipelineElement):
         else:
             text_content, tool_calls = _parse_model_output(completion)
         self.turn_tool_calls.append([_summarize_tool_call(fc) for fc in tool_calls])
+        self.transcript.add(
+            turn=len(self.transcript.steps),
+            input=self.transcript.ids(conversation),
+            raw_input=self.transcript.ids(raw_conversation),
+            prompt_sha256=_sha256_text(prompt),
+            n_input_tokens=int(input_length),
+            completion=completion,
+            completion_with_special_tokens=raw_with_special,
+            tool_calls=[_full_tool_call(fc) for fc in tool_calls],
+            icon=icon_info or None,
+        )
 
         assistant_message = {
             "role": "assistant",

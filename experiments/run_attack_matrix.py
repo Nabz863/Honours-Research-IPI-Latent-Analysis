@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import hashlib
 import json
 import os
 import logging
@@ -69,15 +70,11 @@ from defenses.circuit_breaker import CircuitBreakerDirection
 
 # Add new attack/defense modules here as they're built:
 # from attacks.typographic import TypographicAttack
-# AttentionTracker/AgentSentry/ICON deliberately not wired in yet -- each
-# needs something this matrix doesn't build for it: AttentionTracker
-# needs raw attention weights (output_attentions=True, a different
-# capture mechanism from ActivationExtractor's hidden-state hooks),
-# AgentSentry needs a full dry-run counterfactual re-execution loop at
-# every tool-return boundary, ICON's detection half needs the same
-# multi-layer trajectory data this matrix DOES already produce but isn't
-# assembled into per-episode traces here yet. Deferred, not silently
-# skipped.
+# AttentionTracker (defenses/attention_tracker.py) and ICON
+# (defenses/icon_runtime.py) are wired in below (P2a), outside
+# _build_defense_registry because both need the live model. AgentSentry is
+# archived (archive/README.md): it needs a counterfactual re-execution loop
+# at every tool boundary that this runner does not have.
 
 from extraction.hooks import ActivationExtractor
 
@@ -152,7 +149,7 @@ def _require_gpu_if_hpc(model, hpc: bool) -> None:
 # M3) and re-exported here so existing imports keep working.
 from experiments.episode_utils import (  # noqa: E402
     _cuda_memory_guard, _PROCESS_FATAL_MARKERS, _ensure_inference_state, _run_episode_safely,
-    _build_defense_registry, atomic_write_json, atomic_torch_save,
+    _build_defense_registry, atomic_write_json, atomic_torch_save, atomic_write_json_gz,
 )
 
 
@@ -431,6 +428,8 @@ def run_agentdojo_attack_matrix(
     enable_circuit_breaker_measurement: bool = False,
     circuit_breaker_layer: Optional[int] = None,
     circuit_breaker_k_sigma: float = 2.0,
+    capture_layers: Optional[List[int]] = None,
+    model_name: Optional[str] = None,
 ) -> None:
     """
     Real AgentDojo attack matrix: real tasks (environments.agentdojo_tasks.
@@ -514,7 +513,12 @@ def run_agentdojo_attack_matrix(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    extractor = ActivationExtractor(model, target_layers=target_layers, token_aggregation="last")
+    # target_layers is the ANALYSIS band (defaults for obfuscated activation,
+    # TaskTracker, CircuitBreaker); capture_layers is what every episode
+    # saves -- all layers in the final runs (P2a), for layer heatmaps and the
+    # logit lens.
+    capture_layers = list(capture_layers) if capture_layers is not None else list(target_layers)
+    extractor = ActivationExtractor(model, target_layers=capture_layers, token_aggregation="last")
     registry = _build_attack_registry(model, processor)
     # ICON is deliberately NOT in _build_defense_registry(). It is not a
     # content transformation: ICONDefense.apply() returns its input
@@ -524,6 +528,14 @@ def run_agentdojo_attack_matrix(
     # rows labelled icon-defended containing no defence at all, so it is
     # resolved separately and passed via `icon=`.
     defense_registry = _build_defense_registry() if defense_names else {}
+    _at_cal = None
+    if defense_names and "attention_tracker" in defense_names:
+        # Attention Tracker (D4, P2a): the model is its own detector. Its
+        # important heads and threshold come from synthetic calibration data,
+        # persisted here so every row of this directory uses the same ones.
+        from defenses.attention_tracker import AttentionTrackerDefense, load_or_calibrate
+        _at_cal = load_or_calibrate(model, processor, output_dir / "attention_tracker_calibration.json")
+        defense_registry["attention_tracker"] = AttentionTrackerDefense(model, processor, _at_cal)
     if defense_names:
         for d in defense_names:
             if d == "icon":
@@ -662,15 +674,46 @@ def run_agentdojo_attack_matrix(
                      # code AND task data: catches an editable install with
                      # local changes, which the version string does not
                      # (review 5, M5)
-                     "agentdojo_package_sha": package_sha("agentdojo")}
-    _icon_prober_path = f"defenses/icon_prober_{Path(output_dir).name.split('_')[-1]}.pt"
+                     "agentdojo_package_sha": package_sha("agentdojo"),
+                     # what each episode's .pt holds (P2a: every layer)
+                     "capture_layers": capture_layers,
+                     # LLaVA-NeXT moved fp16 -> bf16 in P2a (audit 14.1); the
+                     # model id alone would not stop a resume mixing the two
+                     "model_dtype": str(next(model.parameters()).dtype)}
+    # The prober is per MODEL; it was located by splitting the output
+    # directory's name, which breaks on any directory not ending in the model
+    # name (P2a).
+    _icon_prober_path = str(Path(__file__).resolve().parents[1] /
+                            f"defenses/icon_prober_{model_name or Path(output_dir).name.split('_')[-1]}.pt")
+    _icon_oracle = os.environ.get("ICON_ORACLE_ATTACKED") == "1"
     _DEF_SHA: Dict[str, Optional[str]] = {}
     for _d in (defense_names or []):
         if _d.startswith("spotlighting"):
             _DEF_SHA[_d] = spotlight_seed_sha()
         elif _d == "icon":
-            _DEF_SHA[_d] = file_sha(_icon_prober_path) or (
-                "oracle" if os.environ.get("ICON_ORACLE_ATTACKED") == "1" else None)
+            # Oracle mode is decided by the environment variable alone, so a
+            # prober file lying around cannot change what a row means.
+            _DEF_SHA[_d] = "oracle" if _icon_oracle else file_sha(_icon_prober_path)
+        elif _d == "attention_tracker":
+            _DEF_SHA[_d] = hashlib.sha256(json.dumps(_at_cal, sort_keys=True).encode()).hexdigest()
+    # ICON is resolved at START-UP, so a missing prober fails before any
+    # episode runs rather than after the clean and attack passes (P2a).
+    _icon_startup = None
+    if defense_names and "icon" in defense_names:
+        from defenses.icon import ICONDefense
+        from defenses.icon_runtime import load_prober_checkpoint
+        _icon_startup = ICONDefense()
+        if _icon_oracle:
+            logger.warning(
+                "ICON: ORACLE mode (ICON_ORACLE_ATTACKED=1): every episode is "
+                "treated as attacked. This evaluates the Mitigating Rectifier "
+                "only -- report as rectifier-under-oracle-detection, NOT as ICON "
+                "end-to-end detection+mitigation.")
+        else:
+            # refuses a missing prober or one without its layer set (B9)
+            _icon_startup.prober, _icon_startup.layer_indices = load_prober_checkpoint(_icon_prober_path)
+            logger.info("ICON: trained prober from %s, layers %s",
+                        _icon_prober_path, _icon_startup.layer_indices)
     _override = None
     if results_log_path.exists():
         with open(results_log_path) as f:
@@ -813,6 +856,28 @@ def run_agentdojo_attack_matrix(
                         for k, v in turns[obfuscation_clean_turn].items()}
         return clean_activations_by_task.get(task_id)
 
+    def _save_episode(sample_id: str, out: Dict[str, Any]) -> None:
+        """Activations and the per-step transcript, both before the row (P2a).
+        An errored episode has no transcript; its row is retried anyway."""
+        atomic_torch_save(out["turn_activations"], output_dir / f"{sample_id}.pt")
+        tp = output_dir / f"{sample_id}.transcript.json.gz"
+        if out.get("transcript") is not None:
+            atomic_write_json_gz(tp, out["transcript"])
+        elif tp.exists():
+            tp.unlink()          # never leave an earlier attempt's transcript beside this row
+
+    def _defense_fields(out: Dict[str, Any]) -> Dict[str, Any]:
+        """What a text defence did to this episode's tool results: for a
+        detector (Attention Tracker), how many it flagged and the scores."""
+        res = out.get("defense_results") or []
+        det = [r for r in res if "detected" in r]
+        if not det:
+            return {}
+        return {"defense_detections": sum(1 for r in det if r.get("detected")),
+                "defense_checked": sum(1 for r in det if r.get("focus_score") is not None),
+                "defense_skipped": sum(1 for r in det if r.get("skipped") and r.get("skipped") != "empty"),
+                "defense_scores": [round(float(r["focus_score"]), 6) for r in det if r.get("focus_score") is not None]}
+
     def _persist() -> None:
         # Atomic, and payloads BEFORE results: a kill between the two must
         # never leave a completed attacked row whose payload is missing
@@ -862,7 +927,7 @@ def run_agentdojo_attack_matrix(
             )
         episode_time_s = time.perf_counter() - t0
 
-        atomic_torch_save(clean_out["turn_activations"], output_dir / f"{sample_id}.pt")
+        _save_episode(sample_id, clean_out)
         if clean_out["turn_activations"]:
             if enable_task_tracker and len(clean_out["turn_activations"]) >= 2:
                 turns = clean_out["turn_activations"]
@@ -1053,7 +1118,7 @@ def run_agentdojo_attack_matrix(
                 )
             episode_time_s = time.perf_counter() - t0
 
-            atomic_torch_save(episode_out["turn_activations"], output_dir / f"{sample_id}.pt")
+            _save_episode(sample_id, episode_out)
 
             # Circuit-breaker calibration data collection -- ONLY during
             # the bootstrapping attack's own loop (see
@@ -1130,34 +1195,8 @@ def run_agentdojo_attack_matrix(
     # attack loop above rather than regenerating it.
     if defense_names:
         for defense_name in defense_names:
-            icon_obj = None
-            defense = None
-            if defense_name == "icon":
-                from defenses.icon import ICONDefense
-                from defenses.icon_runtime import load_prober
-                icon_obj = ICONDefense()
-                import os as _os
-                # model_name is not in scope here (it is a parameter of
-                # _load_model_by_name). Derive the prober path from the
-                # output directory instead, which encodes the model.
-                _pp = _icon_prober_path
-                if _os.path.exists(_pp):
-                    icon_obj.prober = load_prober(_pp)
-                    logger.info("ICON: loaded trained prober from %s", _pp)
-                elif _os.environ.get("ICON_ORACLE_ATTACKED") == "1":
-                    logger.warning(
-                        "ICON: no trained prober, running in ORACLE mode "
-                        "(every episode treated as attacked). This evaluates "
-                        "the Mitigating Rectifier only -- report as "
-                        "rectifier-under-oracle-detection, NOT as ICON "
-                        "end-to-end detection+mitigation.")
-                else:
-                    raise FileNotFoundError(
-                        f"no trained prober at {_pp} and ICON_ORACLE_ATTACKED "
-                        "is unset. An untrained prober classifies at chance, "
-                        "so ICON would flag episodes randomly.")
-            else:
-                defense = defense_registry[defense_name]
+            icon_obj = _icon_startup if defense_name == "icon" else None
+            defense = None if defense_name == "icon" else defense_registry[defense_name]
 
             logger.info("--- Defended CLEAN: %s (%d tasks) ---", defense_name, len(tasks_with_injection))
             for task in tasks_with_injection:
@@ -1174,7 +1213,7 @@ def run_agentdojo_attack_matrix(
                     )
                 episode_time_s = time.perf_counter() - t0
 
-                atomic_torch_save(out["turn_activations"], output_dir / f"{sample_id}.pt")
+                _save_episode(sample_id, out)
                 row = {
                     "sample_id": sample_id,
                     "condition": "defended_clean",
@@ -1192,6 +1231,7 @@ def run_agentdojo_attack_matrix(
                     "double_bos": out.get("double_bos"),
                     "raw_completions": [c[:400] for c in out["turn_raw_completions"]],
                     "icon_info": out.get("turn_icon_info") or [],
+                    **_defense_fields(out),
                     **_measure_task_tracker(task_tracker, out["turn_activations"], tt_layer),
                     **_measure_circuit_breaker(circuit_breaker, out["turn_activations"], cb_layer),
                 }
@@ -1233,7 +1273,7 @@ def run_agentdojo_attack_matrix(
                         )
                     episode_time_s = time.perf_counter() - t0
 
-                    atomic_torch_save(out["turn_activations"], output_dir / f"{sample_id}.pt")
+                    _save_episode(sample_id, out)
                     row = {
                         "sample_id": sample_id,
                         "condition": "defended_attacked",
@@ -1253,6 +1293,7 @@ def run_agentdojo_attack_matrix(
                         "double_bos": out.get("double_bos"),
                         "raw_completions": [c[:400] for c in out["turn_raw_completions"]],
                         "icon_info": out.get("turn_icon_info") or [],
+                        **_defense_fields(out),
                         **_measure_task_tracker(task_tracker, out["turn_activations"], tt_layer),
                         **_measure_circuit_breaker(circuit_breaker, out["turn_activations"], cb_layer),
                     }
@@ -1423,7 +1464,9 @@ if __name__ == "__main__":
         help="Which defenses (from _build_defense_registry) to run against "
              "clean AND every attack in --attack_names. Omit to skip defenses "
              "entirely (attacks/clean still run either way). Available: "
-             "spotlighting_delimiting, spotlighting_datamarking, spotlighting_encoding.",
+             "spotlighting_delimiting, spotlighting_datamarking, spotlighting_encoding, "
+             "attention_tracker, icon (ICON_ORACLE_ATTACKED=1 for the rectifier under "
+             "oracle detection).",
     )
     parser.add_argument(
         "--use_wandb", action="store_true",
@@ -1463,6 +1506,7 @@ if __name__ == "__main__":
             model, processor = _load_model_by_name(args.model, args.hpc)
             _require_gpu_if_hpc(model, args.hpc)
             target_layers = _resolve_target_layers(model, None)
+        from extraction.hooks import all_layers
 
         run_agentdojo_attack_matrix(
             model=model,
@@ -1487,6 +1531,8 @@ if __name__ == "__main__":
             enable_circuit_breaker_measurement=args.enable_circuit_breaker_measurement,
             circuit_breaker_layer=args.circuit_breaker_layer,
             circuit_breaker_k_sigma=args.circuit_breaker_k_sigma,
+            capture_layers=all_layers(model),
+            model_name=args.model,
         )
         print(f"Done. Check {args.output_dir}/ for saved activations and attack_results.json.")
     else:

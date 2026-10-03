@@ -155,6 +155,8 @@ def run_vwa_adv_episode(
     defense: Optional[Any] = None,
     ecso: Optional[Any] = None,
     payload_markers: Optional[List[str]] = None,
+    icon: Optional[Any] = None,
+    capture_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Runs ONE real VWA-Adv episode -- structure ported directly from the
@@ -191,6 +193,7 @@ def run_vwa_adv_episode(
         model, processor, extractor, model_id, instruction_path,
         action_set_tag=action_set_tag, defense=defense, ecso=ecso,
         task_intent=task.intent, payload_markers=payload_markers,
+        icon=icon, capture_dir=capture_dir,
     )
 
     # Page-level blur (audit 13.4 / D3): a CSS filter on every <img>,
@@ -287,6 +290,15 @@ def _run_episode_body(agent, backend, env, task, max_steps, action_set_tag,
             trajectory.append(create_stop_action(""))
             break
 
+    # Per-step text (P2a): the backend's record of every decision, plus the
+    # parsed action as VWA describes it and the URL each observation came from.
+    transcript = backend.transcript.to_json()
+    transcript["actions"] = list(meta_data["action_history"][1:])
+    transcript["urls"] = [getattr((t.get("info") or {}).get("page"), "url", None)
+                          for t in trajectory if isinstance(t, dict) and "observation" in t]
+    transcript["raw_predictions"] = [t.get("raw_prediction") for t in trajectory
+                                     if isinstance(t, dict) and "action_type" in t]
+
     # The page the agent ENDED on. Evaluators may navigate (program_html
     # checks visit their own URLs), so every later evaluation restores this
     # first (review A7).
@@ -323,4 +335,7 @@ def _run_episode_body(agent, backend, env, task, max_steps, action_set_tag,
         "payload_in_prompt": list(backend.payload_in_prompt),
         "final_url": final_url,
         "double_bos": backend.double_bos,
+        "transcript": transcript,
+        "icon_info": list(backend.icon_info),
+        "defense_results": [getattr(r, "metadata", {}) for r in backend._defense_cache.values()],
     }

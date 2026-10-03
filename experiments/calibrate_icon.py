@@ -21,6 +21,13 @@ WHAT IT TRAINS ON
     label 0 = clean episode
     label 1 = attacked episode with --train_attack (default template_ipi)
 
+    LIMITATION (review P2a-A4): features are taken from each episode's LAST
+    turn, where an attacked episode has read the injected tool result; the
+    runners consult the prober on EVERY turn, including turn 0, which it was
+    not trained on. End-to-end ICON numbers inherit that mismatch. The
+    final runs use ORACLE mode (ICON_ORACLE_ATTACKED=1), which does not use
+    the prober at all.
+
 THE OOD TEST, AND WHY IT MATTERS FOR THE WRITE-UP
     ICON's headline claim is out-of-distribution transfer: the paper
     trains on TrojanTools and evaluates on AgentDojo at 97-98%. A prober
@@ -65,7 +72,8 @@ from defenses.icon import ICONDefense, LatentSpaceTraceProber, train_prober  # n
 from environments.agentdojo_tasks import load_tasks, run_agentdojo_episode  # noqa: E402
 from extraction.hooks import ActivationExtractor, _resolve_target_layers  # noqa: E402
 from extraction.model_loader import (  # noqa: E402
-    load_llavanext_7b, load_internvl_8b, load_qwen3vl_8b)
+    load_llavanext_7b, load_internvl_8b, load_qwen3vl_8b, load_gemma4_12b)
+from defenses.icon_runtime import features_from_layer_stats, save_prober  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -73,7 +81,8 @@ logger = logging.getLogger(__name__)
 
 LOADERS = {"llava": load_llavanext_7b,
            "internvl": load_internvl_8b,
-           "qwen3vl": load_qwen3vl_8b}
+           "qwen3vl": load_qwen3vl_8b,
+           "gemma4": load_gemma4_12b}
 
 
 def build_payload(attack_name: str, model, processor, task, context):
@@ -82,10 +91,12 @@ def build_payload(attack_name: str, model, processor, task, context):
     generated. A prober trained on differently-constructed payloads would
     be calibrated for an attack that was never actually run.
 
-    Mirrors run_attack_matrix.py's own logic: the attacker goal is
-    task.target_behavior (populated from injection_task.GOAL when the
-    task was built), and only the FIRST injection vector is used, which
-    is what the matrix does at `vector_id = next(iter(injection_defaults))`.
+    Mirrors run_attack_matrix.py's placement (audit entry 10, P1.1): the
+    payload goes into EVERY vector the user task reads
+    (injection_candidates), appended to each vector's own default, or
+    replacing it for an attack that replaces vector content. The old rule
+    -- the suite's first vector for every task -- put the payload where the
+    task reads it in 54 of 629 pairs.
     """
     from experiments.run_attack_matrix import _build_attack_registry
     reg = _build_attack_registry(model, processor)
@@ -93,23 +104,27 @@ def build_payload(attack_name: str, model, processor, task, context):
         raise SystemExit(f"unknown attack {attack_name!r}; have {sorted(reg)}")
     atk = reg[attack_name]
 
+    from environments.agentdojo_tasks import injection_candidates
     suite = context["suites"][task.suite_name]
     injection_defaults = suite.get_injection_vector_defaults()
     if not injection_defaults:
         return {}
-    vector_id = next(iter(injection_defaults))
-    clean_vector_text = injection_defaults[vector_id]
-
-    res = atk.generate(
-        {"prompt": clean_vector_text, "injectable_field": "text"},
-        target_behavior=task.target_behavior,
-    )
-    return {vector_id: res.adversarial_text or clean_vector_text}
+    vectors = injection_candidates(suite, suite.get_user_task_by_id(task.user_task_id))
+    clean_vector_text = injection_defaults[vectors[0]]
+    res = atk.generate({"page_text": clean_vector_text, "injectable_field": "page_text"},
+                       target_behavior=task.target_behavior)
+    adv = res.adversarial_text or clean_vector_text
+    if not (res.metadata or {}).get("replaces_vector_content") and adv.startswith(clean_vector_text):
+        tail = adv[len(clean_vector_text):]
+        return {v: injection_defaults[v] + tail for v in vectors}
+    return {v: adv for v in vectors}
 
 
 def collect(model, processor, extractor, tasks, context, icon,
             attack_name=None, limit=None):
-    """Runs episodes in record-only mode and returns turn-0 features."""
+    """Runs episodes in record-only mode and returns, per task, the LAST
+    turn's per-layer statistics ({"stats": [L, 3, H], "fis": [L]}); the
+    prober's layers are chosen afterwards, once (review B9)."""
     feats, used = [], []
     for t in tasks[:limit]:
         try:
@@ -185,6 +200,20 @@ def main():
     if len(common) < 10:
         sys.exit("too few paired samples to train a prober")
 
+    # ONE layer set for every sample (review B9), chosen on the TRAINING
+    # pairs: the top-K layers by how much an injection raises mean FIS
+    # (attacked - clean), i.e. the most attack-sensitive layers, which is
+    # what the selection is for (review P2a-A5; clean-only FIS picks the
+    # most concentrated layers, e.g. attention sinks). Per-sample ranking
+    # put different layers into the same feature positions.
+    fis_gap = (torch.stack([f["fis"] for f in af]).mean(0)
+               - torch.stack([f["fis"] for f in cf]).mean(0))
+    layers = torch.topk(fis_gap, min(icon.top_k_layers, fis_gap.numel())).indices.tolist()
+    logger.info("prober layers (top-%d by attacked-clean mean FIS): %s", len(layers), layers)
+    stats_c, stats_a = cf, af
+    cf = [features_from_layer_stats(f["stats"], layers) for f in stats_c]
+    af = [features_from_layer_stats(f["stats"], layers) for f in stats_a]
+
     # Save the raw features BEFORE training. A prober that ends at
     # loss=ln(2)=0.6931 with accuracy exactly 0.5 has emitted identical
     # logits for both classes -- which means either the features do not
@@ -194,8 +223,7 @@ def main():
     import numpy as _np
     feat_path = Path(f"analysis_out/icon_features_{a.model}.pt")
     feat_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"clean": [f.cpu() for f in cf],
-                "attacked": [f.cpu() for f in af],
+    torch.save({"clean": stats_c, "attacked": stats_a, "layers": layers,
                 "task_ids": common}, feat_path)
     logger.info("saved raw features -> %s", feat_path)
 
@@ -214,7 +242,7 @@ def main():
                      "chance. Do NOT report any detection number from this "
                      "run. Inspect %s before rerunning.", feat_path)
 
-    report = {"model": a.model, "train_attack": a.train_attack,
+    report = {"model": a.model, "train_attack": a.train_attack, "layers": layers,
               "n_paired": len(common), "train": stats, "ood": {}}
 
     # --- held-out attack families -------------------------------------
@@ -226,6 +254,7 @@ def main():
         if not f:
             report["ood"][atk] = {"n": 0, "note": "no features collected"}
             continue
+        f = [features_from_layer_stats(x["stats"], layers) for x in f]
         with torch.no_grad():
             pred = torch.stack([prober(z.float()).argmax(-1).squeeze()
                                 for z in f])
@@ -240,7 +269,8 @@ def main():
     report["clean_false_positive_rate"] = float((cp == 1).float().mean())
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(prober.state_dict(), out_path)
+    save_prober(prober, layers, out_path,
+                meta={"model": a.model, "train_attack": a.train_attack, "n_paired": len(common)})
     logger.info("wrote prober -> %s", out_path)
 
     print("\n" + "=" * 62)

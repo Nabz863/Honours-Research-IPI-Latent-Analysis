@@ -100,6 +100,18 @@ def _resolve_target_layers(model: nn.Module, target_layers: Optional[Sequence[in
     return list(range(lo, hi, step))
 
 
+def all_layers(model: nn.Module) -> List[int]:
+    """Every decoder layer index. The capture set for the final runs (P2a,
+    3 Oct): layer heatmaps and the logit lens need the whole stack, not only
+    the late-middle band _resolve_target_layers(model, None) returns. That
+    band is still the DEFAULT ANALYSIS layer set (obfuscated-activation and
+    TaskTracker/CircuitBreaker layer defaults), so the two are kept apart."""
+    layer_list = _get_layer_list(model)
+    if layer_list is None:
+        raise RuntimeError("Could not locate transformer layer list.")
+    return list(range(len(layer_list)))
+
+
 def _get_layer_list(model: nn.Module):
     """
     Return the nn.ModuleList of transformer layers, or None if not found.
@@ -329,22 +341,25 @@ class ActivationExtractor:
                 return
 
             hidden = output[0] if isinstance(output, tuple) else output
+            hidden = hidden.detach()
 
-            h = hidden[0].detach().cpu()  # [seq_len, hidden_dim]
-
+            # Reduce ON THE DEVICE, then copy only the result (P2a). Copying
+            # the whole [seq_len, hidden_dim] state to the CPU first and then
+            # taking one row moved ~30 MB per layer per decision for a 4k-token
+            # prompt -- negligible for 14 layers, not for all of them. The
+            # values are identical: same rows, same dtype, same reduction.
             if self.token_aggregation == "last":
-                # .clone() is REQUIRED, not cosmetic: h[-1] is a VIEW into the
-                # full [seq_len, hidden_dim] tensor, and torch.save() serialises
-                # a view's ENTIRE underlying storage. Without this, every saved
-                # "[4096] activation" silently carries its whole parent sequence
-                # -- confirmed by a 109GB clean_activations_cache.pt (~380MB per
-                # task, vs ~16KB for a real fp32 [4096] vector), and by ~10min of
-                # per-episode overhead spent rewriting it.
-                self._activations[layer_idx] = h[-1].clone()  # [hidden_dim]
+                # .clone() is REQUIRED, not cosmetic: a row is a VIEW, and
+                # torch.save() serialises a view's ENTIRE underlying storage.
+                # Without it every saved "[4096] activation" silently carried
+                # its whole parent sequence -- confirmed by a 109GB
+                # clean_activations_cache.pt (~380MB per task, vs ~16KB for a
+                # real fp32 [4096] vector).
+                self._activations[layer_idx] = hidden[0, -1].to("cpu").clone()  # [hidden_dim]
             elif self.token_aggregation == "mean":
-                self._activations[layer_idx] = h.mean(dim=0)  # [hidden_dim]
+                self._activations[layer_idx] = hidden[0].mean(dim=0).to("cpu").clone()  # [hidden_dim]
             else:  # 'full'
-                self._activations[layer_idx] = h              # [seq_len, hidden_dim]
+                self._activations[layer_idx] = hidden[0].to("cpu")  # [seq_len, hidden_dim]
 
             self._captured_this_cycle.add(layer_idx)
 

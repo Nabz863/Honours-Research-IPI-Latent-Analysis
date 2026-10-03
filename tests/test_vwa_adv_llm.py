@@ -29,7 +29,15 @@ from PIL import Image
 
 # --- Make visualwebarena importable, and satisfy its import-time env-var
 # --- requirements, before importing anything that touches it. ---
-_VWA_ROOT = os.environ.get("VWA_ROOT", "/home/claude/vwa_work/visualwebarena")
+# VWA_ADV_REPO is the variable the runner uses; VWA_ROOT is kept for older
+# invocations. The default is the cluster checkout. Skipped (not failed) when
+# no checkout is present.
+_VWA_ROOT = (os.environ.get("VWA_ADV_REPO") or os.environ.get("VWA_ROOT")
+             or "/datasets/nmahomed/vwa-adv/visualwebarena")
+if not Path(_VWA_ROOT, "browser_env").is_dir():
+    import pytest
+    pytest.skip(f"visualwebarena checkout not found at {_VWA_ROOT} (set VWA_ADV_REPO)",
+                allow_module_level=True)
 sys.path.insert(0, _VWA_ROOT)
 for _var in ("REDDIT", "SHOPPING", "WIKIPEDIA", "HOMEPAGE", "CLASSIFIEDS",
              "REDDIT_RESET_URL", "SHOPPING_ADMIN", "GITLAB", "MAP"):
@@ -109,7 +117,8 @@ class _FakeGenerativeVLM(nn.Module):
 class _FakeInnerTokenizer:
     """Backs HFTokenizerAdapter -- deterministic word-count tokenization."""
 
-    def encode(self, text):
+    def encode(self, text, add_special_tokens=True):
+        # add_special_tokens: HFTokenizerAdapter passes False (audit 11.10).
         return [min(abs(hash(w)) % 100, 99) + 1 for w in text.split()] or [1]
 
     def decode(self, ids):
@@ -327,12 +336,31 @@ def test_backend_generate_two_steps_do_not_overwrite_each_other():
     extractor = ActivationExtractor(model, target_layers=[0], token_aggregation="last")
     backend = LocalVLMBackend(model, processor, extractor, max_new_tokens=8)
 
-    prompt = {"conversation": [{"role": "user", "content": [{"type": "text", "text": "go"}, {"type": "image"}]}], "images": [Image.new("RGB", (4, 4))]}
-    backend.generate(prompt)
-    backend.generate(prompt)
+    def _prompt():
+        return {"conversation": [{"role": "user", "content": [{"type": "text", "text": "go"}, {"type": "image"}]}],
+                "images": [Image.new("RGB", (4, 4))]}
+    backend.generate(_prompt())
+    backend.generate(_prompt())
 
     assert len(backend.step_activations) == 2
     assert backend.step_activations[0] is not backend.step_activations[1]
+
+
+def test_backend_parse_retry_with_same_prompt_object_is_deduplicated():
+    """Audit 11.9: VWA's PromptAgent retries a failed parse with the SAME
+    prompt object; under greedy decoding the retry is identical, so the
+    backend returns the cached response and records one activation entry."""
+    model = _FakeGenerativeVLM(n_layers=2, dim=8)
+    processor = _FakeChatProcessor(completion_text='```stop [x]```')
+    extractor = ActivationExtractor(model, target_layers=[0], token_aggregation="last")
+    backend = LocalVLMBackend(model, processor, extractor, max_new_tokens=8)
+    prompt = {"conversation": [{"role": "user", "content": [{"type": "text", "text": "go"}, {"type": "image"}]}],
+              "images": [Image.new("RGB", (4, 4))]}
+    a = backend.generate(prompt)
+    b = backend.generate(prompt)
+    assert a == b
+    assert len(backend.step_activations) == 1
+    assert backend.retries_deduplicated == 1
 
 
 # ---------------------------------------------------------------------------

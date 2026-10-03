@@ -259,4 +259,10 @@ def run_agentdojo_episode(
         "turn_icon_info": llm.turn_icon_info,
         "turn_icon_features": llm.turn_icon_features,
         "double_bos": llm.double_bos,
+        # Per-step text (P2a): every prompt as the model saw it, the
+        # undefended version, full completions and tool calls.
+        "transcript": llm.transcript.to_json(),
+        # What each text defence did to each distinct tool result (detection
+        # scores for Attention Tracker; boundary/variant for spotlighting).
+        "defense_results": [getattr(r, "metadata", {}) for r in llm._defense_cache.values()],
     }

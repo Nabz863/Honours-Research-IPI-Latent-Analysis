@@ -22,6 +22,15 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# visualwebarena on the path, as the runner does (VWA_ADV_REPO); skipped,
+# not failed, when no checkout is present.
+_VWA_ROOT = (os.environ.get("VWA_ADV_REPO") or os.environ.get("VWA_ROOT")
+             or "/datasets/nmahomed/vwa-adv/visualwebarena")
+if not Path(_VWA_ROOT, "browser_env").is_dir():
+    import pytest
+    pytest.skip(f"visualwebarena checkout not found at {_VWA_ROOT} (set VWA_ADV_REPO)",
+                allow_module_level=True)
+sys.path.insert(0, _VWA_ROOT)
 
 # Real browser_env import needs these set before ANY import of
 # environments.vwa_adv_tasks (which imports environments.vwa_adv_llm,

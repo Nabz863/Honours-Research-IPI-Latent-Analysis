@@ -48,10 +48,16 @@ def test_delimiting_wraps_content_and_matches_addendum():
     assert "never" in result.system_prompt_addendum.lower()
 
 
-def test_delimiting_boundary_is_fresh_each_call():
+def test_delimiting_boundary_is_deterministic_per_content():
+    """Review A18 (P1.1): the boundary is an HMAC of the content under the run
+    seed, so a rerun reproduces every boundary, while different content gets
+    a different boundary and the token is unpredictable without the seed."""
     defense = SpotlightingDefense(variant="delimiting")
-    boundaries = {defense.apply(SAMPLE_CONTENT).metadata["boundary"] for _ in range(20)}
-    assert len(boundaries) == 20, "Boundary tokens should never repeat across calls"
+    same = {defense.apply(SAMPLE_CONTENT).metadata["boundary"] for _ in range(5)}
+    assert len(same) == 1, "same content must get the same boundary (reproducible reruns)"
+    others = {defense.apply(SAMPLE_CONTENT + f" {i}").metadata["boundary"] for i in range(20)}
+    assert len(others) == 20, "different content must get different boundaries"
+    assert next(iter(same)) not in others
 
 
 def test_datamarking_replaces_all_whitespace():
@@ -106,7 +112,7 @@ if __name__ == "__main__":
     tests = [
         test_invalid_variant_raises,
         test_delimiting_wraps_content_and_matches_addendum,
-        test_delimiting_boundary_is_fresh_each_call,
+        test_delimiting_boundary_is_deterministic_per_content,
         test_datamarking_replaces_all_whitespace,
         test_datamarking_custom_marker_character,
         test_encoding_round_trips_exactly,
