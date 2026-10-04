@@ -430,6 +430,8 @@ def run_agentdojo_attack_matrix(
     circuit_breaker_k_sigma: float = 2.0,
     capture_layers: Optional[List[int]] = None,
     model_name: Optional[str] = None,
+    only_samples: Optional[set] = None,
+    dedup_defended_clean: bool = False,
 ) -> None:
     """
     Real AgentDojo attack matrix: real tasks (environments.agentdojo_tasks.
@@ -513,6 +515,8 @@ def run_agentdojo_attack_matrix(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    from experiments.episode_utils import acquire_dir_lock
+    acquire_dir_lock(output_dir)       # one runner per directory (P2a.1)
     # target_layers is the ANALYSIS band (defaults for obfuscated activation,
     # TaskTracker, CircuitBreaker); capture_layers is what every episode
     # saves -- all layers in the final runs (P2a), for layer heatmaps and the
@@ -529,13 +533,18 @@ def run_agentdojo_attack_matrix(
     # resolved separately and passed via `icon=`.
     defense_registry = _build_defense_registry() if defense_names else {}
     _at_cal = None
-    if defense_names and "attention_tracker" in defense_names:
+    from defenses.attention_tracker import parse_at_name, at_defense_sha
+    _at_names = [d for d in (defense_names or []) if parse_at_name(d)[0]]
+    if _at_names:
         # Attention Tracker (D4, P2a): the model is its own detector. Its
-        # important heads and threshold come from synthetic calibration data,
-        # persisted here so every row of this directory uses the same ones.
+        # important heads come from synthetic calibration data, persisted here
+        # so every row of this directory uses the same ones. attention_tracker
+        # acts at the released 0.5; attention_tracker_tNN at 0.NN, e.g. _t30 = 0.30 (P2a.1).
         from defenses.attention_tracker import AttentionTrackerDefense, load_or_calibrate
         _at_cal = load_or_calibrate(model, processor, output_dir / "attention_tracker_calibration.json")
-        defense_registry["attention_tracker"] = AttentionTrackerDefense(model, processor, _at_cal)
+        for _n in _at_names:
+            defense_registry[_n] = AttentionTrackerDefense(model, processor, _at_cal,
+                                                           threshold=parse_at_name(_n)[1], name=_n)
     if defense_names:
         for d in defense_names:
             if d == "icon":
@@ -651,6 +660,8 @@ def run_agentdojo_attack_matrix(
     from experiments.code_version import (code_version, check_resume_compatible, attack_code_sha,
                                           file_sha, model_identity, spotlight_seed_sha, write_manifest,
                                           package_version, package_sha)
+    if only_samples is not None:
+        logger.info("--only_samples: %d sample id(s) selected", len(only_samples))
     _CV = code_version()
     logger.info("code version: commit=%s dirty=%s harness=%s attacks=%s",
                 _CV["commit"], _CV["dirty"], _CV["harness_sha256"][:12], _CV["attacks_sha256"][:12])
@@ -679,7 +690,14 @@ def run_agentdojo_attack_matrix(
                      "capture_layers": capture_layers,
                      # LLaVA-NeXT moved fp16 -> bf16 in P2a (audit 14.1); the
                      # model id alone would not stop a resume mixing the two
-                     "model_dtype": str(next(model.parameters()).dtype)}
+                     "model_dtype": str(next(model.parameters()).dtype),
+                     # Different GPU types round differently and greedy decoding
+                     # can then diverge, so a resume on another card type is
+                     # refused (P2a.1).
+                     "gpu_name": (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+                     # one defended-clean episode per USER task (A13); recorded
+                     # because it changes what the defended-clean rows are
+                     "dedup_defended_clean": bool(dedup_defended_clean)}
     # The prober is per MODEL; it was located by splitting the output
     # directory's name, which breaks on any directory not ending in the model
     # name (P2a).
@@ -694,8 +712,8 @@ def run_agentdojo_attack_matrix(
             # Oracle mode is decided by the environment variable alone, so a
             # prober file lying around cannot change what a row means.
             _DEF_SHA[_d] = "oracle" if _icon_oracle else file_sha(_icon_prober_path)
-        elif _d == "attention_tracker":
-            _DEF_SHA[_d] = hashlib.sha256(json.dumps(_at_cal, sort_keys=True).encode()).hexdigest()
+        elif parse_at_name(_d)[0]:
+            _DEF_SHA[_d] = at_defense_sha(_at_cal, parse_at_name(_d)[1])
     # ICON is resolved at START-UP, so a missing prober fails before any
     # episode runs rather than after the clean and attack passes (P2a).
     _icon_startup = None
@@ -777,7 +795,7 @@ def run_agentdojo_attack_matrix(
             row.setdefault("resume_override", _override)
         # Clean and defended-clean inputs depend only on the USER task, so
         # the same episode recurs once per injection task (review A13).
-        # Analyses must de-duplicate on (user_task_id, condition, defence)
+        # Analyses must de-duplicate on (suite_name, user_task_id, condition, defence)
         # for UA and for any probe split.
         if "task_id" in row and "user_task_id" not in row:
             _t = _task_by_id.get(row["task_id"])
@@ -878,6 +896,25 @@ def run_agentdojo_attack_matrix(
                 "defense_skipped": sum(1 for r in det if r.get("skipped") and r.get("skipped") != "empty"),
                 "defense_scores": [round(float(r["focus_score"]), 6) for r in det if r.get("focus_score") is not None]}
 
+    def _selected(sample_id: str) -> bool:
+        """--only_samples: run exactly these sample ids, nothing else (P2a.1;
+        used for the Attention Tracker second-threshold pass)."""
+        return only_samples is None or sample_id in only_samples
+
+    def _clean_transcript(task_id: str) -> Optional[Dict[str, Any]]:
+        """This task's clean-episode transcript, for attacks that optimise in
+        the agent's real context (P2c's rebuilt GCG / obfuscated activation)."""
+        sid = f"clean_{task_id}"
+        p = output_dir / f"{sid}.transcript.json.gz"
+        if not (_is_complete(sid) and p.exists()):
+            return None
+        import gzip as _gz
+        try:
+            return json.loads(_gz.decompress(p.read_bytes()))
+        except Exception as e:
+            logger.warning("could not read %s (%s: %s)", p.name, type(e).__name__, e)
+            return None
+
     def _persist() -> None:
         # Atomic, and payloads BEFORE results: a kill between the two must
         # never leave a completed attacked row whose payload is missing
@@ -916,6 +953,8 @@ def run_agentdojo_attack_matrix(
     logger.info("--- Clean baseline pass (%d tasks) ---", len(tasks_with_injection))
     for task in tasks_with_injection:
         sample_id = f"clean_{task.task_id}"
+        if not _selected(sample_id):
+            continue
         if _is_complete(sample_id):
             logger.info("  skip %s (already done)", sample_id)
             continue
@@ -987,6 +1026,8 @@ def run_agentdojo_attack_matrix(
         logger.info("--- Attack: %s (%d tasks) ---", attack_name, len(tasks_with_injection))
         for task in tasks_with_injection:
             sample_id = f"{attack_name}_{task.task_id}"
+            if not _selected(sample_id):
+                continue
             if _is_complete(sample_id):
                 logger.info("  skip %s (already done)", sample_id)
                 continue
@@ -1040,7 +1081,16 @@ def run_agentdojo_attack_matrix(
             else:
                 stored = None
             cache_key = (attack_name, task.suite_name, tuple(vector_ids), task.target_behavior)
-            cached = None if attack_name == "obfuscated_activation" else _gen_cache.get(cache_key)
+            # An attack that optimises in the task's own context (attribute
+            # uses_task_context, P2c) is per task, like obfuscated_activation.
+            _per_task = attack_name == "obfuscated_activation" or getattr(attack, "uses_task_context", False)
+            cached = None if _per_task else _gen_cache.get(cache_key)
+            if getattr(attack, "uses_task_context", False) and stored is None:
+                gen_kwargs["clean_transcript"] = _clean_transcript(task.task_id)
+                if gen_kwargs["clean_transcript"] is None:
+                    # never optimise without the context it needs (review P2a.1, #9)
+                    _row_skip(sample_id, attack_name, task, "no clean-episode transcript for this task")
+                    continue
             t0 = time.perf_counter()
             attack_generation_error: Optional[str] = None
             try:
@@ -1054,7 +1104,7 @@ def run_agentdojo_attack_matrix(
                             {"page_text": clean_vector_text, "injectable_field": "page_text"},
                             **gen_kwargs,
                         )
-                        if attack_name != "obfuscated_activation":
+                        if not _per_task:
                             _gen_cache[cache_key] = adv_result
             except torch.OutOfMemoryError as e:
                 torch.cuda.empty_cache()
@@ -1199,10 +1249,49 @@ def run_agentdojo_attack_matrix(
             defense = None if defense_name == "icon" else defense_registry[defense_name]
 
             logger.info("--- Defended CLEAN: %s (%d tasks) ---", defense_name, len(tasks_with_injection))
+            _rep: Dict[str, str] = {}          # user task -> its representative pair
+            for task in tasks_with_injection:
+                # keyed by SUITE too: user_task_0 exists in every suite (review P2a.1, #1)
+                _rep.setdefault((task.suite_name, task.user_task_id), task.task_id)
             for task in tasks_with_injection:
                 sample_id = f"defended_{defense_name}_{task.task_id}"
+                if not _selected(sample_id):
+                    continue
                 if _is_complete(sample_id):
                     logger.info("  skip %s (already done)", sample_id)
+                    continue
+                if dedup_defended_clean and _rep[(task.suite_name, task.user_task_id)] != task.task_id:
+                    # A defended-clean episode's input depends only on the USER
+                    # task (review A13), so each user task runs once and its
+                    # other pairs point at that episode. Written only once the
+                    # representative row has completed; until then it is left
+                    # for the next pass or resume.
+                    rep_sid = f"defended_{defense_name}_{_rep[(task.suite_name, task.user_task_id)]}"
+                    if not _is_complete(rep_sid):
+                        # An ERROR row, so it is counted, retried on resume, and
+                        # visible to the band script (review P2a.1, #3).
+                        _record_result(sample_id, {
+                            "sample_id": sample_id, "condition": "defended_clean", "attack_name": "clean",
+                            "defense_name": defense_name, "task_id": task.task_id,
+                            "suite_name": task.suite_name, "asr_success": None, "utility_success": None,
+                            "num_turns": 0, "deduplicated_to": rep_sid,
+                            "error": f"deferred: representative {rep_sid} not complete"})
+                        _persist()
+                        logger.info("  defer %s (representative %s not complete)", sample_id, rep_sid)
+                        continue
+                    rep_row = results_log[results_index[rep_sid]]
+                    _record_result(sample_id, {
+                        "sample_id": sample_id, "condition": "defended_clean", "attack_name": "clean",
+                        "defense_name": defense_name, "task_id": task.task_id, "suite_name": task.suite_name,
+                        "asr_success": None, "utility_success": rep_row.get("utility_success"),
+                        "num_turns": rep_row.get("num_turns"), "error": None,
+                        "deduplicated_to": rep_sid,
+                        # the detector's view of the episode it points at (review P2a.1, #4)
+                        **{k: rep_row[k] for k in ("defense_detections", "defense_checked",
+                                                   "defense_skipped", "defense_scores") if k in rep_row},
+                    })
+                    _persist()
+                    logger.info("  dedup %s -> %s", sample_id, rep_sid)
                     continue
 
                 t0 = time.perf_counter()
@@ -1250,6 +1339,8 @@ def run_agentdojo_attack_matrix(
                 )
                 for task in tasks_with_injection:
                     sample_id = f"{attack_name}_defended_{defense_name}_{task.task_id}"
+                    if not _selected(sample_id):
+                        continue
                     if _is_complete(sample_id):
                         logger.info("  skip %s (already done)", sample_id)
                         continue
@@ -1493,6 +1584,16 @@ if __name__ == "__main__":
     parser.add_argument("--circuit_breaker_layer", type=int, default=None)
     parser.add_argument("--circuit_breaker_k_sigma", type=float, default=2.0)
     parser.add_argument("--output_dir", type=str, default="attack_matrix_dryrun")
+    parser.add_argument(
+        "--only_samples", type=str, default=None,
+        help="file with one sample_id per line: run exactly those and nothing else "
+             "(e.g. the Attention Tracker second-threshold pass, from "
+             "analysis/at_threshold_band.py select).")
+    parser.add_argument(
+        "--dedup_defended_clean", action="store_true",
+        help="run each defended-clean episode once per USER task (its input does not "
+             "depend on the injection task, review A13); the other pairs get rows "
+             "pointing at it (deduplicated_to). Recorded in run_settings.")
     args = parser.parse_args()
 
     if args.agentdojo:
@@ -1533,6 +1634,9 @@ if __name__ == "__main__":
             circuit_breaker_k_sigma=args.circuit_breaker_k_sigma,
             capture_layers=all_layers(model),
             model_name=args.model,
+            only_samples=(set(l.strip() for l in open(args.only_samples) if l.strip())
+                          if args.only_samples else None),
+            dedup_defended_clean=args.dedup_defended_clean,
         )
         print(f"Done. Check {args.output_dir}/ for saved activations and attack_results.json.")
     else:

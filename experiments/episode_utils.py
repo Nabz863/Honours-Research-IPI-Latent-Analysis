@@ -75,6 +75,70 @@ def atomic_write_json_gz(path, obj) -> None:
     _atomic(path, lambda f: f.write(data))
 
 
+def acquire_dir_lock(output_dir) -> None:
+    """One runner process per output directory (P2a.1 review). Each process
+    rewrites attack_results.json from its own in-memory rows, so two at once
+    erase each other's. The lock records the SLURM job; a lock left by a job
+    that is no longer queued or running is taken over, a live one stops this
+    process before it touches anything. Released at exit."""
+    import atexit
+    import subprocess
+    lock = Path(output_dir) / ".runner.lock"
+    me = os.environ.get("SLURM_JOB_ID") or f"pid{os.getpid()}"
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(f"{me} {os.uname().nodename} {os.getpid()}\n")
+            atexit.register(lambda: lock.unlink() if lock.exists() and
+                            lock.read_text().split()[:1] == [me] else None)
+            return
+        except FileExistsError:
+            parts = lock.read_text().split() or ["?"]
+            owner = parts[0]
+            if owner == me:
+                return                               # this process (or job) already holds it
+            alive = None
+            if owner.startswith("pid") and len(parts) >= 3 and parts[1] == os.uname().nodename:
+                try:
+                    os.kill(int(parts[2]), 0); alive = True
+                except ProcessLookupError:
+                    alive = False
+                except Exception:
+                    alive = None
+            elif owner.isdigit():
+                # alive only on a clear answer; a transient squeue failure is
+                # retried, and only "invalid job id" / empty output means gone
+                for _try in range(3):
+                    try:
+                        r = subprocess.run(["squeue", "-h", "-j", owner, "-o", "%T"],
+                                           capture_output=True, text=True, timeout=30)
+                    except FileNotFoundError:
+                        alive = None; break
+                    except Exception:
+                        alive = None
+                    else:
+                        if r.returncode == 0:
+                            alive = bool(r.stdout.strip()); break
+                        if "invalid job id" in (r.stderr or "").lower():
+                            alive = False; break
+                        alive = True                 # squeue erred: assume live, retry
+                    import time as _t
+                    _t.sleep(10)
+            if alive is False or (alive is None and owner.isdigit()):
+                # finished job, or squeue unavailable on this node: a resubmit
+                # after a walltime kill must not be blocked by its own old lock
+                logger.warning("taking over the lock from job %s (%s; %s)", owner, lock,
+                               "no longer queued" if alive is False else "state unknown")
+                lock.unlink()
+                continue
+            raise SystemExit(
+                f"FATAL: {output_dir} is in use by job {owner} ({lock}). Two runners on one "
+                "directory erase each other's rows. Wait for it, or delete the lock if that job "
+                "is certainly gone.")
+    raise SystemExit(f"FATAL: could not take {lock}")
+
+
 def atomic_torch_save(obj, path) -> None:
     _atomic(path, lambda f: torch.save(obj, f))
 

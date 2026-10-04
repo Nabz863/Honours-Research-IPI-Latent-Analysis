@@ -274,6 +274,8 @@ def run_curated_matrix(
 
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    from experiments.episode_utils import acquire_dir_lock
+    acquire_dir_lock(output_dir)       # one runner per directory (P2a.1)
     exp_data = exp_data.resolve()
     os.chdir(str(AGENT_ATTACK_REPO))  # see module docstring -- storage_state paths depend on this
 
@@ -362,12 +364,18 @@ def run_curated_matrix(
         defense_registry = {**_build_defense_registry(),
                             **build_visual_defense_registry()}
         ecso_registry = build_ecso_registry()
-        if "attention_tracker" in defense_names:
-            # The model is its own detector (D4, P2a); heads and threshold from
-            # synthetic calibration data, persisted with this directory.
+        from defenses.attention_tracker import parse_at_name, at_defense_sha
+        _at_names = [d for d in defense_names if parse_at_name(d)[0]]
+        if _at_names:
+            # The model is its own detector (D4, P2a); heads from synthetic
+            # calibration data, persisted with this directory. NOT in the
+            # final VWA-Adv set (decision 4 Oct): every long page observation
+            # scores below the threshold, clean or attacked.
             from defenses.attention_tracker import AttentionTrackerDefense, load_or_calibrate
             _at_cal = load_or_calibrate(model, processor, output_dir / "attention_tracker_calibration.json")
-            defense_registry["attention_tracker"] = AttentionTrackerDefense(model, processor, _at_cal)
+            for _n in _at_names:
+                defense_registry[_n] = AttentionTrackerDefense(model, processor, _at_cal,
+                                                               threshold=parse_at_name(_n)[1], name=_n)
         for d in defense_names:
             if d == "icon":
                 continue
@@ -410,6 +418,8 @@ def run_curated_matrix(
         # what each step's activation entry holds (P2a: every layer)
         "capture_layers": capture_layers,
         "model_dtype": str(next(model.parameters()).dtype),
+        # a resume on another GPU type is refused: greedy decoding can diverge (P2a.1)
+        "gpu_name": (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
         # Inputs outside this repo that change what an episode is (review 4,
         # M4): the agent prompt, visualwebarena's environment and evaluator
         # code, and agent-attack's task data for the selected tasks.
@@ -428,9 +438,10 @@ def run_curated_matrix(
             base=exp_data),
     }
     _DEF_SHA = {d: spotlight_seed_sha() for d in (defense_names or []) if d.startswith("spotlighting")}
-    if defense_names and "attention_tracker" in defense_names:
-        import hashlib as _hl
-        _DEF_SHA["attention_tracker"] = _hl.sha256(json.dumps(_at_cal, sort_keys=True).encode()).hexdigest()
+    for _d in (defense_names or []):
+        from defenses.attention_tracker import parse_at_name as _pan, at_defense_sha as _ads
+        if _pan(_d)[0]:
+            _DEF_SHA[_d] = _ads(_at_cal, _pan(_d)[1])
     if icon_obj is not None:
         from experiments.code_version import file_sha as _file_sha
         _DEF_SHA["icon"] = "oracle" if _icon_oracle else _file_sha(str(_icon_prober_path))
@@ -922,6 +933,18 @@ def run_curated_matrix(
     def _cap_counts():
         return (captioner.n_images, captioner.n_failures, captioner.n_calls_while_hooked, captioner.n_oom)
 
+    def _clean_transcript(task):
+        sid_c = f"clean_{task.name}"
+        p = output_dir / f"{sid_c}.transcript.json.gz"
+        if not (done(sid_c) and p.exists()):
+            return None
+        import gzip as _gz
+        try:
+            return json.loads(_gz.decompress(p.read_bytes()))
+        except Exception as e:
+            logger.warning("could not read %s (%s)", p.name, e)
+            return None
+
     def _save_episode(sid, out):
         """Activations and the per-step transcript, before the row (P2a)."""
         atomic_torch_save(out.get("step_activations", []), output_dir / f"{sid}.pt")
@@ -1007,6 +1030,16 @@ def run_curated_matrix(
                     base_input = {"prompt": task.intent, "image": img,
                                   "injectable_field": "caption", "caption": clean_cap,
                                   "adv_dir": str(task.adv_dir)}
+                    # The clean episode's transcript, for attacks that optimise
+                    # in the agent's real context (P2c; attribute uses_task_context).
+                    if getattr(registry[attack_name], "uses_task_context", False) and \
+                            _payloads.get((attack_name, task.name)) is None:
+                        base_input["clean_transcript"] = _clean_transcript(task)
+                        if base_input["clean_transcript"] is None:
+                            record(sid, {"sample_id": sid, "attack_name": attack_name, "task_id": task.name,
+                                         "error": "no clean reference activation for this task "
+                                                  "(clean transcript missing)"})
+                            continue
 
                     # A payload already persisted for this (attack, task)
                     # is REUSED, never regenerated: defended cells may

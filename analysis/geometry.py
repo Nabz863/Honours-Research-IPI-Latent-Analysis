@@ -127,13 +127,26 @@ def user_task_group(task_id):
     return m.group(1) if m else str(task_id)
 
 
-def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=False):
+def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=False,
+                  include_errored=False):
+    """
+    include_errored: default False. A row carrying an `error` did not produce
+    an episode that can be trusted as its label claims -- e.g. "no cached
+    payload" episodes RAN against the clean image, so their activations are
+    real but the attack was never delivered. Set True only for a deliberate
+    analysis of failed episodes.
+
+    results_dirs are read IN PRIORITY ORDER. If two directories contain the
+    same (episode, attack), the FIRST is kept and the collision is reported.
+    """
     rows = []
     for d in results_dirs:
         rows.extend(load_rows(d))
 
     by_key = defaultdict(dict)
     missing, loaded, errored = 0, 0, 0
+    skipped_error, collisions = 0, 0
+    collision_examples = []
 
     for r in rows:
         # Defended rows carry the SAME attack_name as undefended ones, so
@@ -141,7 +154,20 @@ def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=Fa
         # any directory holding both. Undefended rows only, unless the
         # caller asks otherwise -- the same fault was found and fixed in
         # analysis/stats.py.
-        if not include_defended and (r.get("defense_name") not in (None, "none")):
+        # The defence may be recorded under any of several keys -- a sampled
+        # row from vwa_adv_qwen3vl_def2 carried no `defense_name` at all -- and
+        # defended sample_ids always contain "_defended_". Check both, so a
+        # key-name mismatch cannot silently pass defended rows as undefended.
+        _defense = (r.get("defense_name") or r.get("defense")
+                    or r.get("defence_name") or r.get("defence"))
+        _is_defended = (_defense not in (None, "none")) or \
+            ("_defended_" in str(r.get("sample_id", "")))
+        if not include_defended and _is_defended:
+            continue
+        # A row carrying an error is not a trustworthy episode of what its
+        # label says. See the build_dataset docstring.
+        if r.get("error") and not include_errored:
+            skipped_error += 1
             continue
         attack = r.get("attack_name")
         p = tensor_path(r)
@@ -149,16 +175,39 @@ def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=Fa
             missing += 1
             continue
         acts = load_episode(p, turn_strategy)
-        if acts is None:
+        # Empty counts as unreadable. Job 61500 wrote ~1.5 KB archives holding
+        # an empty list; `is None` alone let those through. len() rather than
+        # truthiness, because truthiness on a multi-element Tensor raises.
+        if acts is None or (hasattr(acts, "__len__") and len(acts) == 0):
             errored += 1
             continue
-        by_key[episode_key(r)][attack] = {"acts": acts, "row": r}
+        _k = episode_key(r)
+        if attack in by_key[_k]:
+            # Same (episode, attack) already loaded from an earlier directory.
+            # Keep the first -- directories are read in priority order -- and
+            # report, instead of silently overwriting as this code used to.
+            collisions += 1
+            if len(collision_examples) < 5:
+                collision_examples.append(
+                    (str(_k), attack, by_key[_k][attack]["row"].get("_results_dir"),
+                     r.get("_results_dir")))
+            continue
+        by_key[_k][attack] = {"acts": acts, "row": r}
         loaded += 1
 
     if verbose:
         total = len(rows)
         print("[join] rows=%d  tensors_loaded=%d  missing_file=%d  unreadable=%d"
-              % (total, loaded, missing, errored))
+              "  skipped_error_rows=%d  cross_dir_collisions=%d"
+              % (total, loaded, missing, errored, skipped_error, collisions))
+        if collisions:
+            print("[join] WARNING: %d (episode, attack) pairs appeared in more "
+                  "than one results dir. The FIRST dir's copy was kept; "
+                  "the order you pass directories in decides which run's data "
+                  "is analysed. Examples:" % collisions)
+            for _k, _a, _kept, _dropped in collision_examples:
+                print("         %s / %s  kept %s, dropped %s"
+                      % (_k, _a, _kept, _dropped))
         if total and loaded / total < 0.9:
             print("[join] WARNING: join rate %.1f%% -- every downstream number "
                   "is computed on this subset only." % (100.0 * loaded / total))

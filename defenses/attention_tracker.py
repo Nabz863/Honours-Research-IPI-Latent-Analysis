@@ -490,6 +490,29 @@ def calibrate_heads(model, processor, k_values=(4.0, 3.0, 2.0, 1.0)) -> Dict[str
     }
 
 
+import re as _re
+
+_AT_NAME = _re.compile(r"^attention_tracker(?:_t(\d{2}))?$")
+
+
+def parse_at_name(name: str):
+    """'attention_tracker' -> (True, None): the calibration's threshold (0.5).
+    'attention_tracker_t30' -> (True, 0.30): same detector and calibration,
+    threshold 0.30 (P2a.1: a second operating point, run only on the episodes
+    whose scores fall between the two thresholds). Anything else -> (False, None)."""
+    m = _AT_NAME.match(name or "")
+    if not m:
+        return False, None
+    return True, (int(m.group(1)) / 100.0 if m.group(1) else None)
+
+
+def at_defense_sha(calibration: Dict[str, Any], threshold: Optional[float]) -> str:
+    """The stamp of one Attention Tracker condition: its calibration and the
+    threshold it acts at."""
+    t = float(calibration["threshold"]) if threshold is None else float(threshold)
+    return _hashlib.sha256((_json.dumps(calibration, sort_keys=True) + f"|t={t:.4f}").encode()).hexdigest()
+
+
 class AttentionTrackerDefense(BaseDefense):
     """Live Attention Tracker. A text defence: rides the runners' defense=
     path (tool results in AgentDojo, the observation in VWA-Adv) and runs one
@@ -499,11 +522,14 @@ class AttentionTrackerDefense(BaseDefense):
 
     name = "attention_tracker"
 
-    def __init__(self, model, processor, calibration: Dict[str, Any]):
+    def __init__(self, model, processor, calibration: Dict[str, Any],
+                 threshold: Optional[float] = None, name: Optional[str] = None):
         self.model, self.processor = model, processor
         self.calibration = calibration
         self.heads = [tuple(h) for h in calibration["heads"]]
-        self.threshold = float(calibration["threshold"])
+        self.threshold = float(calibration["threshold"]) if threshold is None else float(threshold)
+        if name:
+            self.name = name
         self.windows = layer_windows(model) if model is not None else None
 
     def focus_score(self, text: str) -> Tuple[Optional[float], int]:
