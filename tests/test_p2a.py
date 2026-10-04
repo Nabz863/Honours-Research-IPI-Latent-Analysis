@@ -575,3 +575,26 @@ def test_agentdojo_scoring_guard_restored_after_pipeline_exception(monkeypatch):
     with pytest.raises(RuntimeError, match="generation failed"):
         run()
     assert "_check_task_result" not in vars(suite)
+
+
+# ---------------------------------------------------------------------------
+# P2a.3: the dual-judge launcher imports VWA in the runner's order, then the
+# patch still reaches every reference (job 63837 died importing it directly)
+# ---------------------------------------------------------------------------
+def test_dual_judge_launcher_check_only_reaches_preimported_evaluators():
+    import subprocess
+    vwa = os.environ.get("VWA_ADV_REPO", "/datasets/nmahomed/vwa-adv/visualwebarena")
+    if not Path(vwa, "evaluation_harness").is_dir():
+        pytest.skip("visualwebarena checkout not found (set VWA_ADV_REPO)")
+    env = dict(os.environ, OPENAI_API_KEY="dummy-not-used", CLASSIFIEDS_RESET_TOKEN="x")
+    for v in ("REDDIT", "SHOPPING", "WIKIPEDIA", "HOMEPAGE", "CLASSIFIEDS",
+              "REDDIT_RESET_URL", "SHOPPING_ADMIN", "GITLAB", "MAP"):
+        env.setdefault(v, "http://localhost:9999")
+    repo = Path(__file__).resolve().parent.parent
+    p = subprocess.run([sys.executable, "experiments/run_with_dual_judge.py", "--vwa_path", vwa,
+                        "--dj_check_only", "--dj_no_local", "--dj_records", os.devnull],
+                       cwd=repo, env=env, capture_output=True, text=True, timeout=600)
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "evaluation_harness.evaluators.llm_fuzzy_match" in p.stderr      # rebound, not just the source
+    assert "evaluation_harness.evaluators.llm_ua_match" in p.stderr
+    assert "browser_env imported first" in p.stderr                        # the order is enforced

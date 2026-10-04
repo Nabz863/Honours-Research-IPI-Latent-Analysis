@@ -22,11 +22,15 @@ WHY A LAUNCHER AND NOT A PATCH
     difference.
 
 ORDERING
-    install() must run before the harness's evaluators module is imported,
-    or at least be able to find it -- see _rebind_aliases in dual_judge for
-    why. This launcher installs first, passing --vwa_path so
-    evaluation_harness is importable at that point, then hands off. Modules
-    the runner imports afterwards pick up the patched functions naturally.
+    VWA is imported in the runner's own order -- the browser_env package
+    first, then evaluation_harness -- and install() runs after that. The
+    order is load-bearing: the cluster's VWA checkout no-ops @beartype from
+    the top of browser_env/__init__.py, and a VWA module imported before
+    browser_env keeps the real decorator, which fails on Python 3.14 (job
+    63837; see main()). Because evaluators is already imported when install()
+    runs, its from-imported copies of the judges are rebound by
+    _rebind_aliases in dual_judge; modules imported afterwards pick up the
+    patched functions naturally.
 
     The install is VERIFIED before handing off. A silently inert patch is
     the failure mode that matters here: the run would complete, the two
@@ -66,15 +70,30 @@ DEFAULT_VWA = "/datasets/nmahomed/vwa-adv/visualwebarena"
 RUNNER = "experiments.run_vwa_adv_curated_matrix"
 
 
+def _print_versions() -> None:
+    import platform
+    vers = [f"python {platform.python_version()}"]
+    from importlib import metadata
+    for m in ("beartype", "numpy", "typing_extensions", "pydantic"):
+        try:
+            vers.append(f"{m} {metadata.version(m)}")
+        except Exception:                                    # noqa: BLE001
+            vers.append(f"{m} ?")
+    print("  versions: " + ", ".join(vers), file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--vwa_path", default=os.environ.get("VWA_PATH", DEFAULT_VWA))
+    ap.add_argument("--vwa_path", default=os.environ.get("VWA_ADV_REPO")
+                    or os.environ.get("VWA_PATH") or DEFAULT_VWA)
     ap.add_argument("--dj_records",
                     default="analysis_out/judge_verdicts.jsonl")
     ap.add_argument("--dj_local_model",
                     default="meta-llama/Llama-3.1-8B-Instruct")
     ap.add_argument("--dj_no_local", action="store_true")
     ap.add_argument("--dj_require_openai", action="store_true")
+    ap.add_argument("--dj_check_only", action="store_true",
+                    help="import, install and verify, then exit (no run)")
     ap.add_argument("-h", "--help", action="store_true")
     known, passthrough = ap.parse_known_args()
 
@@ -101,6 +120,53 @@ def main() -> int:
               "the two judged tasks. Those figures will not reproduce the "
               "benchmark's own metric.", file=sys.stderr)
 
+    # Import VisualWebArena's browser_env package FIRST, then
+    # evaluation_harness -- the runner's own order -- before install().
+    # The cluster's VWA checkout carries a hand patch at the top of
+    # browser_env/__init__.py that replaces beartype.beartype with a no-op
+    # (methodology ledger prior-C, #4: numpy 2.x broke beartype's NDArray
+    # handling). Only modules that run `from beartype import beartype` AFTER
+    # that patch get the no-op. evaluators.py and agent/agent.py import
+    # beartype before their first browser_env import, so importing either
+    # first keeps the real decorator, which (beartype 0.12 on Python 3.14)
+    # rejects every Union hint: job 63837 died that way when install()
+    # imported evaluation_harness.helper_functions directly, as does
+    # tests/test_vwa_adv_llm.py importing agent.agent first. install() then
+    # rebinds the judges inside the already-imported evaluators
+    # (dual_judge._rebind_aliases); verify() below refuses to start if any
+    # reference still holds an original.
+    vwa = str(Path(known.vwa_path).resolve())
+    runner_vwa = str(Path(os.environ.get("VWA_ADV_REPO", DEFAULT_VWA)).resolve())
+    if vwa != runner_vwa:
+        print(f"FATAL: --vwa_path {vwa} is not the checkout the runner uses "
+              f"(VWA_ADV_REPO -> {runner_vwa}); one process would mix two VWA copies",
+              file=sys.stderr)
+        return 5
+    if vwa not in sys.path:
+        sys.path.insert(0, vwa)
+    early = sorted(m for m in sys.modules
+                   if m.split(".")[0] in ("evaluation_harness", "agent", "llms"))
+    if early:
+        print(f"FATAL: VWA modules imported before browser_env: {early}", file=sys.stderr)
+        return 5
+    try:
+        import browser_env  # noqa: F401  -- first: applies the checkout's beartype patch
+        import beartype as _bt
+        print(f"[launcher] browser_env imported first; beartype.beartype is now "
+              f"'{getattr(_bt.beartype, '__name__', _bt.beartype)}'", file=sys.stderr)
+        from evaluation_harness import evaluator_router  # noqa: F401
+        if known.dj_check_only:
+            # the rest of what the run imports after the handoff
+            import environments.vwa_adv_tasks  # noqa: F401
+            import agent.agent  # noqa: F401
+    except Exception as e:                                   # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        print(f"FATAL: visualwebarena does not import in the runner's order: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        _print_versions()
+        return 5
+
     from environments import dual_judge
 
     ok = dual_judge.install(
@@ -114,6 +180,7 @@ def main() -> int:
               "written to show it. Refusing to start the run.\n"
               f"  checked --vwa_path {known.vwa_path}",
               file=sys.stderr)
+        _print_versions()
         return 3
 
     v = dual_judge.verify()
@@ -124,7 +191,12 @@ def main() -> int:
               file=sys.stderr)
         return 4
     print(f"[launcher] dual judge verified on {len(v['patched'])} "
-          f"reference(s); handing off to {RUNNER}", file=sys.stderr)
+          f"reference(s): {', '.join(v['patched'])}", file=sys.stderr)
+    if known.dj_check_only:
+        print("[launcher] --dj_check_only: imports, install and verify OK; "
+              "not running", file=sys.stderr)
+        return 0
+    print(f"[launcher] handing off to {RUNNER}", file=sys.stderr)
 
     sys.argv = ["run_vwa_adv_curated_matrix.py"] + passthrough
     runpy.run_module(RUNNER, run_name="__main__")
