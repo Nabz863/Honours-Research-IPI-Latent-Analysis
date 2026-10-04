@@ -492,3 +492,86 @@ def test_attention_tracker_trimming_template_and_mistral_window():
                             num_attention_heads=2, num_key_value_heads=1, sliding_window=sw)
         assert AT.layer_windows(MistralForCausalLM(cfg)) == [want, want]
     assert AT.layer_windows(_tiny_internvl()) == [None] * 8
+
+
+# ---------------------------------------------------------------------------
+# P2a.2: AgentDojo's own success check raising must not discard the episode
+# ---------------------------------------------------------------------------
+def _episode_setup():
+    from tests.test_agentdojo_llm import _FakeGenerativeVLM, _FakeChatProcessor
+    from extraction.hooks import ActivationExtractor
+    import environments.agentdojo_tasks as T
+    tasks, ctx = T.load_tasks(suite_names=["slack"])
+    task = next(t for t in tasks if t.user_task_id == "user_task_0" and t.injection_task_id == "injection_task_1")
+    model = _FakeGenerativeVLM(n_layers=3, dim=8)
+    run = lambda: T.run_agentdojo_episode(model, _FakeChatProcessor(completion_text="Done."),
+                                          ActivationExtractor(model, target_layers=[0, 1, 2]),
+                                          task, ctx, injections={})
+    return T, ctx["suites"]["slack"], run
+
+
+def _in_benchmark_code(src, name):
+    """A function whose frames carry an agentdojo/default_suites/ filename,
+    standing in for a benchmark task check that raises."""
+    ns = {}
+    exec(compile(src, os.path.join(os.sep, "x", "agentdojo", "default_suites", "fake.py"), "exec"), ns)
+    return ns[name]
+
+
+@pytest.mark.parametrize("raiser", ["security", "utility", "none"])
+def test_agentdojo_scoring_exception_is_recorded_not_fatal(monkeypatch, raiser):
+    """slack injection_task_1.security() reads user_inbox["Alice"]; an agent
+    that removed Alice made it raise KeyError (LLaVA smoke 63785) and the
+    whole episode was lost on every retry. Real slack suite, fake model."""
+    T, suite, run = _episode_setup()
+    if raiser == "security":
+        # the real benchmark code path: Alice gone from the environment
+        orig = type(suite).load_and_inject_default_environment
+        def no_alice(self, injections):
+            env = orig(self, injections)
+            env.slack.user_inbox.pop("Alice", None)
+            return env
+        monkeypatch.setattr(type(suite), "load_and_inject_default_environment", no_alice)
+    elif raiser == "utility":
+        usr_cls = type(suite.get_user_task_by_id("user_task_0"))
+        monkeypatch.setattr(usr_cls, "utility", _in_benchmark_code(
+            "def boom(self, *a, **k):\n    raise KeyError('Alice')\n", "boom"))
+        monkeypatch.setattr(usr_cls, "utility_from_traces", lambda self, *a, **k: None, raising=False)
+
+    out = run()
+    assert "_check_task_result" not in vars(suite)          # instance patch removed
+    assert out["turn_activations"] and out["transcript"]["steps"]   # episode kept
+    if raiser == "none":
+        assert out["scoring_errors"] is None
+        assert isinstance(out["asr_success"], bool) and isinstance(out["utility_success"], bool)
+    elif raiser == "security":
+        assert out["asr_success"] is None and isinstance(out["utility_success"], bool)
+        assert out["scoring_errors"] == {"security": "KeyError: 'Alice'"}
+    else:
+        assert out["utility_success"] is None and isinstance(out["asr_success"], bool)
+        assert out["scoring_errors"] == {"utility": "KeyError: 'Alice'"}
+
+
+def test_agentdojo_scoring_guard_reraises_our_own_bugs(monkeypatch):
+    """An exception that never reaches benchmark task code (our pipeline's
+    output breaking AgentDojo's text conversion, say) still fails the
+    episode, and the suite is restored on that path too."""
+    T, suite, run = _episode_setup()
+    import agentdojo.task_suite.task_suite as TS
+    def broken(*a, **k):
+        raise TypeError("malformed content block")
+    monkeypatch.setattr(TS, "get_text_content_as_str", broken)
+    with pytest.raises(TypeError, match="malformed content block"):
+        run()
+    assert "_check_task_result" not in vars(suite)
+
+
+def test_agentdojo_scoring_guard_restored_after_pipeline_exception(monkeypatch):
+    T, suite, run = _episode_setup()
+    from environments.agentdojo_llm import LocalVLMPipelineElement
+    def dies(self, *a, **k):
+        raise RuntimeError("generation failed")
+    monkeypatch.setattr(LocalVLMPipelineElement, "query", dies)
+    with pytest.raises(RuntimeError, match="generation failed"):
+        run()
+    assert "_check_task_result" not in vars(suite)

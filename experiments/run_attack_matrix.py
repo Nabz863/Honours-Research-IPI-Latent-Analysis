@@ -987,6 +987,7 @@ def run_agentdojo_attack_matrix(
             "error": episode_error,
             "tool_calls": clean_out["turn_tool_calls"],
             "double_bos": clean_out.get("double_bos"),
+            "scoring_errors": clean_out.get("scoring_errors"),
             "raw_completions": [c[:400] for c in clean_out["turn_raw_completions"]],
         }
         _record_result(sample_id, row)
@@ -1206,6 +1207,7 @@ def run_agentdojo_attack_matrix(
                 "error": episode_error,
                 "tool_calls": episode_out["turn_tool_calls"],
                 "double_bos": episode_out.get("double_bos"),
+                "scoring_errors": episode_out.get("scoring_errors"),
                 "raw_completions": [c[:400] for c in episode_out["turn_raw_completions"]],
                 **{f"attack_meta_{k}": v for k, v in adv_result.metadata.items()},
                 **_measure_task_tracker(task_tracker, episode_out["turn_activations"], tt_layer),
@@ -1288,7 +1290,8 @@ def run_agentdojo_attack_matrix(
                         "deduplicated_to": rep_sid,
                         # the detector's view of the episode it points at (review P2a.1, #4)
                         **{k: rep_row[k] for k in ("defense_detections", "defense_checked",
-                                                   "defense_skipped", "defense_scores") if k in rep_row},
+                                                   "defense_skipped", "defense_scores",
+                                                   "scoring_errors") if k in rep_row},
                     })
                     _persist()
                     logger.info("  dedup %s -> %s", sample_id, rep_sid)
@@ -1318,6 +1321,7 @@ def run_agentdojo_attack_matrix(
                     "error": episode_error,
                     "tool_calls": out["turn_tool_calls"],
                     "double_bos": out.get("double_bos"),
+                    "scoring_errors": out.get("scoring_errors"),
                     "raw_completions": [c[:400] for c in out["turn_raw_completions"]],
                     "icon_info": out.get("turn_icon_info") or [],
                     **_defense_fields(out),
@@ -1382,6 +1386,7 @@ def run_agentdojo_attack_matrix(
                         "error": episode_error,
                         "tool_calls": out["turn_tool_calls"],
                         "double_bos": out.get("double_bos"),
+                        "scoring_errors": out.get("scoring_errors"),
                         "raw_completions": [c[:400] for c in out["turn_raw_completions"]],
                         "icon_info": out.get("turn_icon_info") or [],
                         **_defense_fields(out),

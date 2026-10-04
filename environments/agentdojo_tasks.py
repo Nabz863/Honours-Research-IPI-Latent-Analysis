@@ -41,6 +41,9 @@ cluster before trusting it for a full matrix run.
 
 from __future__ import annotations
 
+import logging
+import os
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -50,6 +53,8 @@ from agentdojo.agent_pipeline.tool_execution import ToolsExecutionLoop, ToolsExe
 from agentdojo.task_suite.load_suites import get_suites
 
 from environments.agentdojo_llm import LocalVLMPipelineElement
+
+logger = logging.getLogger(__name__)
 
 # The benchmark's OWN system message (audit 11.6). The previous one-line
 # custom message omitted who the user is (Emma Johnson, Blue Sparrow Tech)
@@ -185,6 +190,19 @@ def injection_candidates(suite, user_task, benchmark_version: str = "") -> List[
     return cands
 
 
+_BENCHMARK_TASK_DIR = os.sep + "default_suites" + os.sep
+
+
+def _raised_in_benchmark_task_code(exc: BaseException) -> bool:
+    """True when the exception passed through AgentDojo's own task
+    definitions (agentdojo/default_suites/...), i.e. the benchmark's success
+    check itself failed. An exception raised before reaching task code (in
+    task_suite.py turning our pipeline's messages into text, say) has no such
+    frame and is re-raised as our bug."""
+    return any(_BENCHMARK_TASK_DIR in f.filename and "agentdojo" in f.filename
+               for f in traceback.extract_tb(exc.__traceback__))
+
+
 def run_agentdojo_episode(
     model,
     processor,
@@ -234,12 +252,50 @@ def run_agentdojo_episode(
     tools_loop = ToolsExecutionLoop([ToolsExecutor(tool_result_to_str), llm])
     pipeline = AgentPipeline([SystemMessage(DEFAULT_SYSTEM_MESSAGE), InitQuery(), llm, tools_loop])
 
-    utility, security = suite.run_task_with_pipeline(
-        agent_pipeline=pipeline,
-        user_task=user_task,
-        injection_task=injection_task,
-        injections=injections or {},
-    )
+    # AgentDojo's own success checks can raise on states an agent can reach:
+    # slack injection_task_1's security() reads user_inbox["Alice"], which is
+    # gone once the agent has removed Alice (KeyError, LLaVA smoke 63785).
+    # Uncaught, the exception discarded the whole episode, activations and
+    # all, and the row failed identically on every retry. The check is guarded
+    # here for THIS call only: the episode completes, its activations are
+    # kept, and the score it could not compute is None with the reason
+    # recorded (scoring_errors) -- never silently False (P2a.2).
+    # Only exceptions raised inside the benchmark's OWN task code
+    # (agentdojo/default_suites/...) are absorbed. Anything else -- e.g. a
+    # malformed message from our pipeline breaking get_text_content_as_str --
+    # is our bug and still fails the episode loudly (review P2a.2, #4).
+    # Single-threaded only: the suite object is shared process-wide.
+    from agentdojo.base_tasks import BaseUserTask
+    scoring_errors: Dict[str, str] = {}
+    _orig_check = suite._check_task_result
+
+    def _guarded_check(task_obj, *a, **k):
+        try:
+            return _orig_check(task_obj, *a, **k)
+        except Exception as e:
+            if not _raised_in_benchmark_task_code(e):
+                raise
+            kind = "utility" if isinstance(task_obj, BaseUserTask) else "security"
+            scoring_errors[kind] = f"{type(e).__name__}: {str(e)[:160]}"
+            logger.warning("AgentDojo %s check raised for %s/%s/%s; score recorded as None",
+                           kind, task.suite_name, task.user_task_id, task.injection_task_id,
+                           exc_info=True)
+            return False
+
+    suite._check_task_result = _guarded_check
+    try:
+        utility, security = suite.run_task_with_pipeline(
+            agent_pipeline=pipeline,
+            user_task=user_task,
+            injection_task=injection_task,
+            injections=injections or {},
+        )
+    finally:
+        del suite._check_task_result          # back to the class's own method
+    if "utility" in scoring_errors:
+        utility = None
+    if "security" in scoring_errors:
+        security = None
 
 
     # security is only meaningful when an injection_task was actually run --
@@ -262,6 +318,7 @@ def run_agentdojo_episode(
         # Per-step text (P2a): every prompt as the model saw it, the
         # undefended version, full completions and tool calls.
         "transcript": llm.transcript.to_json(),
+        "scoring_errors": scoring_errors or None,
         # What each text defence did to each distinct tool result (detection
         # scores for Attention Tracker; boundary/variant for spotlighting).
         "defense_results": [getattr(r, "metadata", {}) for r in llm._defense_cache.values()],
