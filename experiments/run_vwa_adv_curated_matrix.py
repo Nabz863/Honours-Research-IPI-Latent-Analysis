@@ -691,13 +691,36 @@ def run_curated_matrix(
             return f"caption seeding failed: {type(e).__name__}: {str(e)[:120]}"
         return None
 
+    # combined description -> its payload part, for the reachability marker:
+    # the description STARTS with the attack image's caption, so the default
+    # marker (its first 60 characters) would say nothing about whether the
+    # payload survived observation truncation (review P2b, S1)
+    _combined_payload: Dict[str, str] = {}
+
     def _victim_caption(text, image, meta, attack_name, task, blur_def=None):
         """The caption the agent sees for the victim image under attack.
         Attacker-written text IS the caption, built as <clean caption> +
         <payload>; under blur the clean part is the BLURRED clean caption,
         so attacked = clean + payload holds in every pass. An image-only
         attack's caption is our model's caption of the adversarial image,
-        blurred if a page-level blur is active."""
+        blurred if a page-level blur is active.
+
+        An attack that returns BOTH an image and text (COMET, CrossInject:
+        cross-modal by design) changes the image AND appends to its
+        description, so the description is our model's caption of the
+        ADVERSARIAL image followed by the payload -- not the clean image's
+        caption, which would discard the image half under self-captioning
+        (P2b)."""
+        if text and image is not None:
+            gen_clean = (meta or {}).get("clean_caption") or ""
+            payload = text[len(gen_clean):] if gen_clean and text.startswith(gen_clean) else text
+            cap = _self_caption("adv", _image_key(image), image, blur_def)
+            if _cap_failed["v"]:
+                return None, "caption_failed"
+            payload = " ".join(payload.split())
+            full = f"{cap} {payload}".strip()
+            _combined_payload[full] = payload
+            return full, "self_caption+attacker_text"
         if text:
             gen_clean = (meta or {}).get("clean_caption") or ""
             if gen_clean and text.startswith(gen_clean):
@@ -837,6 +860,11 @@ def run_curated_matrix(
         out = []
         for c in (adv_cap or {}).values():
             c = (c or "").strip()
+            if c in _combined_payload:
+                # its END: observation truncation cuts from the end, so the
+                # tail is what has to survive (review P2b, re-check)
+                out.append(_combined_payload[c][-60:])
+                continue
             if clean_cap and c.startswith(clean_cap):
                 c = c[len(clean_cap):].strip()
             c = " ".join(c.split())
@@ -1029,7 +1057,10 @@ def run_curated_matrix(
                     clean_cap = _clean_caption(task, None)
                     base_input = {"prompt": task.intent, "image": img,
                                   "injectable_field": "caption", "caption": clean_cap,
-                                  "adv_dir": str(task.adv_dir)}
+                                  "adv_dir": str(task.adv_dir),
+                                  # the string the paper's captioner attack optimises toward
+                                  # (P2b pixel / patch / CrossInject target the self-captioner)
+                                  "target_caption": task.data.get("target_caption") or ""}
                     # The clean episode's transcript, for attacks that optimise
                     # in the agent's real context (P2c; attribute uses_task_context).
                     if getattr(registry[attack_name], "uses_task_context", False) and \

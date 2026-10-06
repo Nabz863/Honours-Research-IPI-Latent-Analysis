@@ -66,8 +66,9 @@ bottom). Not yet run against real weights.
 
 from __future__ import annotations
 
+import hashlib
+import random
 import re
-import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
@@ -334,8 +335,13 @@ class CometAttack(BaseAttack):
                 "entangle a goal with no content words. Use cross_modal_injection instead."
             )
 
-        rng = secrets.SystemRandom()
-        decoys = rng.sample(_DECOYS, min(self.n_decoys, len(_DECOYS)))
+        # Decoys: seeded by the goal, so a retry or a resume draws the same
+        # ones (was an unseeded SystemRandom), and capped to the regions the
+        # entities leave free -- with 4 entities and 3 decoys the 7th item had
+        # no region and was silently not drawn while still listed (review B23).
+        free = max(0, len(_REGIONS) - len(entities))
+        rng = random.Random(int.from_bytes(hashlib.sha256(target_behavior.encode("utf-8", "replace")).digest()[:8], "big"))
+        decoys = rng.sample(_DECOYS, min(self.n_decoys, len(_DECOYS), free))
 
         adv_image, placement, render_meta = self._render_entities(image, entities, decoys)
         if self.scenario_nesting:

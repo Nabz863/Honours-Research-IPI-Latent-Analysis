@@ -25,17 +25,14 @@ The patch framing is also the more realistic web threat: an attacker
 who can upload an image controls its content outright, but generally
 cannot apply an imperceptible delta to someone ELSE'S served image.
 
-REUSE: subclasses PixelPerturbationAttack to inherit its verified
-AnyRes tiling (_build_anyres_patches, _AnyResGeometry) -- getting that
-right took a real GPU run to discover and a source-verified rewrite to
-fix, and duplicating it here would risk the two drifting apart.
-generate() is reimplemented rather than parameterised because the
-optimisation constraint genuinely differs (masked, unbounded) and
-threading a flag through the parent's loop would obscure both.
+REUSE: subclasses PixelPerturbationAttack for its settings; the shared
+optimisation loop takes the patch mask and the unbounded step.
 
-STATUS: NOT yet run against real model weights. The AnyRes machinery it
-inherits is verified; the masked-update loop specific to this file is
-not.
+P2b (5 Oct): retargeted at the self-captioner, sharing pixel_perturbation's
+objective (attacks/captioner_objective.py): the patch, mid-grey at the start
+and unbounded within [0,1], is optimised so the agent model captions the image
+as the task's target caption. Tested on a tiny real Qwen3-VL (tests/test_p2b.py:
+nothing outside the patch changes); real weights: the P2b smoke.
 """
 
 from __future__ import annotations
@@ -47,7 +44,7 @@ import torch
 from PIL import Image
 
 from .base import AttackModality, AttackResult
-from .pixel_perturbation import PixelPerturbationAttack, _AnyResGeometry
+from .pixel_perturbation import PixelPerturbationAttack
 
 
 class AdversarialPatchAttack(PixelPerturbationAttack):
@@ -63,7 +60,10 @@ class AdversarialPatchAttack(PixelPerturbationAttack):
         patch_frac: float = 0.25,
         position: str = "center",
         alpha: float = 4 / 255,
-        iters: int = 200,
+        iters: int = 500,
+        check_every: int = 50,
+        max_seconds: float = 1200.0,
+        opt_max_side: int = 768,
     ):
         """
         patch_frac : patch edge length as a fraction of the image's SHORTER
@@ -82,7 +82,8 @@ class AdversarialPatchAttack(PixelPerturbationAttack):
         iters : gradient steps. Same cost profile as pixel_perturbation
             (one full forward+backward per step).
         """
-        super().__init__(model, processor, epsilon=1.0, alpha=alpha, iters=iters)
+        super().__init__(model, processor, epsilon=1.0, alpha=alpha, iters=iters,
+                         check_every=check_every, max_seconds=max_seconds, opt_max_side=opt_max_side)
         if position not in ("center", "top_left", "bottom_right", "random"):
             raise ValueError(f"position must be center/top_left/bottom_right/random, got {position!r}")
         self.patch_frac = patch_frac
@@ -98,9 +99,10 @@ class AdversarialPatchAttack(PixelPerturbationAttack):
             y0, x0 = 0, 0
         elif self.position == "bottom_right":
             y0, x0 = height - side, width - side
-        else:  # random
-            y0 = int(torch.randint(0, max(1, height - side + 1), (1,)).item())
-            x0 = int(torch.randint(0, max(1, width - side + 1), (1,)).item())
+        else:  # random -- seeded by the image shape, so a retry reproduces it
+            g = torch.Generator().manual_seed(height * 100003 + width)
+            y0 = int(torch.randint(0, max(1, height - side + 1), (1,), generator=g).item())
+            x0 = int(torch.randint(0, max(1, width - side + 1), (1,), generator=g).item())
         return y0, y0 + side, x0, x0 + side
 
     def generate(
@@ -108,108 +110,32 @@ class AdversarialPatchAttack(PixelPerturbationAttack):
         base_input: Dict[str, Any],
         target_behavior: str,
         image: Optional[Image.Image] = None,
-        prompt: Optional[str] = None,
         **kwargs,
     ) -> AttackResult:
+        """Retargeted at the self-captioner (P2b), like pixel_perturbation:
+        the patch is optimised so the agent model captions the image as the
+        task's target caption. The patch region starts mid-grey and is
+        unbounded within [0,1]; nothing outside it changes."""
+        from .captioner_objective import optimise_caption, target_caption_of
         image = image or base_input.get("image")
         if image is None:
             raise ValueError("AdversarialPatchAttack needs a base image (pass image= or base_input['image']).")
+        target = target_caption_of(base_input)
+        bounds: Dict[str, Any] = {}
 
-        prompt = prompt or base_input.get("prompt", "Describe this image.")
-        image_token = getattr(self.processor, "image_token", None)
-        if image_token and image_token not in prompt:
-            prompt = f"{image_token}\n{prompt}"
+        def _mask(h: int, w: int) -> torch.Tensor:
+            y0, y1, x0, x1 = self._patch_bounds(h, w)
+            bounds.update(yxyx=(y0, y1, x0, x1), area=((y1 - y0) * (x1 - x0)) / (h * w))
+            m = torch.zeros(1, 1, h, w)
+            m[:, :, y0:y1, x0:x1] = 1.0
+            return m
 
-        device = next(self.model.parameters()).device
-        image = image.convert("RGB")
-        clean = torch.from_numpy(np.array(image).astype("float32") / 255.0)
-        clean = clean.permute(2, 0, 1).unsqueeze(0).to(device)  # [1,3,H,W]
-
-        h, w = clean.shape[-2], clean.shape[-1]
-        y0, y1, x0, x1 = self._patch_bounds(h, w)
-        mask = torch.zeros_like(clean)
-        mask[:, :, y0:y1, x0:x1] = 1.0
-
-        # Initialise the patch region to mid-grey rather than to the
-        # original content: an unbounded patch has no reason to start
-        # near the clean image, and a neutral start avoids biasing the
-        # optimisation toward whatever happened to be underneath.
-        delta = torch.zeros_like(clean)
-        delta[:, :, y0:y1, x0:x1] = 0.5 - clean[:, :, y0:y1, x0:x1]
-        delta = delta.detach().requires_grad_(True)
-
-        from .geometry_adapters import get_adapter
-        adapter = get_adapter(self.processor)
-        plan = adapter.plan(h, w)
-
-        full_text = f"{prompt} {target_behavior}"
-        prompt_only = self.processor(images=image, text=prompt, return_tensors="pt")
-        prompt_len = prompt_only["input_ids"].shape[1]
-        full_inputs = self.processor(images=image, text=full_text, return_tensors="pt")
-        full_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in full_inputs.items()}
-        labels = full_inputs["input_ids"].clone()
-        labels[:, :prompt_len] = -100
-        full_inputs["use_cache"] = False
-
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        # train() so HF's gradient checkpointing actually engages (the flag
-        # alone is gated on self.training inside decoder layers); Dropout
-        # forced back to eval for deterministic gradients. Same fix and
-        # same reasoning as pixel_perturbation.py.
-        self.model.train()
-        for m in self.model.modules():
-            if isinstance(m, (torch.nn.Dropout, torch.nn.BatchNorm1d,
-                              torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
-                m.eval()
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
-        final_loss = None
-        for _ in range(self.iters):
-            adv = (clean + delta).clamp(0, 1)
-            inputs = dict(full_inputs)
-            # move only tensors -- Gemma's adapter also returns
-            # num_soft_tokens_per_image as a plain Python list
-            _ai = adapter.build(adv.squeeze(0), plan)
-            inputs.update({k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                           for k, v in _ai.items()})
-            inputs["labels"] = labels
-
-            outputs = self.model(**inputs)
-            loss = outputs.loss
-            loss.backward()
-            final_loss = float(loss.detach())
-
-            with torch.no_grad():
-                grad = delta.grad
-                grad.sign_()
-                # Masked step: only the patch region moves. No epsilon
-                # clamp -- the patch is unbounded within [0,1], which is
-                # the defining difference from pixel_perturbation.
-                delta.data = delta.data - self.alpha * grad * mask
-                delta.data = (torch.clamp(clean + delta, 0, 1) - clean) * mask
-                delta.grad.zero_()
-
-            del outputs, loss
-            torch.cuda.empty_cache()
-
-        adv_final = self._tensor_to_pil((clean + delta).clamp(0, 1))
-
-        return AttackResult(
-            attack_name=self.name,
-            modality=self.modality,
-            adversarial_image=adv_final,
-            target_behavior=target_behavior,
-            metadata={
-                "patch_frac": self.patch_frac,
-                "position": self.position,
-                "patch_bounds_yxyx": (y0, y1, x0, x1),
-                "patch_area_frac": float(((y1 - y0) * (x1 - x0)) / (h * w)),
-                "alpha": self.alpha,
-                "iters": self.iters,
-                "final_loss": final_loss,
-                "adapter": adapter.name,
-                "target_resolution": (plan.target_h, plan.target_w),
-            },
-        )
+        adv, meta = optimise_caption(
+            self.model, self.processor, image, target,
+            epsilon=1.0, alpha=self.alpha, iters=self.iters, check_every=self.check_every,
+            max_seconds=self.max_seconds, opt_max_side=self.opt_max_side,
+            mask_fn=_mask, init="grey")
+        meta.update({"patch_frac": self.patch_frac, "position": self.position,
+                     "patch_bounds_yxyx": bounds.get("yxyx"), "patch_area_frac": bounds.get("area")})
+        return AttackResult(attack_name=self.name, modality=self.modality, adversarial_image=adv,
+                            adversarial_text=None, target_behavior=target_behavior, metadata=meta)

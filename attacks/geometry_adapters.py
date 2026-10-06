@@ -212,7 +212,10 @@ class QwenPatchAdapter(GeometryAdapter):
 
         # the processor consumes [0,255]-scale tensors; do_rescale applies 1/255
         x = (adv01 * 255.0).unsqueeze(0)                      # [1,C,H,W]
-        x = self._resize(x, plan.target_h, plan.target_w)
+        if tuple(x.shape[-2:]) != (plan.target_h, plan.target_w):
+            # Already at the processor's own size (the P2b attacks optimise
+            # there): its resize is the identity, so none is reproduced.
+            x = self._resize(x, plan.target_h, plan.target_w)
         patches = self._rescale_normalize(x)
 
         b, c = patches.shape[:2]
@@ -351,9 +354,11 @@ class Gemma4UnifiedAdapter(GeometryAdapter):
         patch, pool, mst = e["patch"], e["pool"], e["max_soft_tokens"]
 
         x = adv01 * 255.0                                   # [C,H,W]
-        x = self.ip.aspect_ratio_preserving_resize(
-            image=x, patch_size=patch, max_patches=mst * pool ** 2,
-            pooling_kernel_size=pool, resample=self.ip.resample)
+        if tuple(x.shape[-2:]) != (plan.target_h, plan.target_w):
+            # (skipped at the processor's own size, as for Qwen)
+            x = self.ip.aspect_ratio_preserving_resize(
+                image=x, patch_size=patch, max_patches=mst * pool ** 2,
+                pooling_kernel_size=pool, resample=self.ip.resample)
         x = self._rescale_normalize(x)
 
         ph, pw = x.shape[-2] // patch, x.shape[-1] // patch

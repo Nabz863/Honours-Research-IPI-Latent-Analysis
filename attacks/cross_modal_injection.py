@@ -53,9 +53,13 @@ half is TemplateIPIAttack, a fixed template library, not a learned
 generator. Describe this as "CrossInject-style" -- VLA is now real, TGE
 is not.
 
-STATUS: mechanics verified offline against a synthetic model; VLA needs a
-real GPU run to confirm the projector hook fires and the alignment loss
-decreases. Check vla_loss_start vs vla_loss_end in the returned metadata.
+P2b (5 Oct), UNDER SELF-CAPTIONING: the visual half is the captioner attack
+(attacks/captioner_objective.py: the agent model's own captioning request,
+target = the task's target caption) plus VLA toward that caption's embedding;
+the textual half is the template-IPI payload, which the runner appends to our
+model's caption of the adversarial image. CrossInject minus pixel_perturbation,
+paired by task, isolates VLA plus the text half (audit 12.11). Tiny-model test:
+tests/test_p2b.py; real weights: the P2b smoke (vla_loss_start/end recorded).
 """
 
 from __future__ import annotations
@@ -69,7 +73,6 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .base import AttackModality, AttackResult, BaseAttack
-from .pixel_perturbation import PixelPerturbationAttack, _AnyResGeometry
 from .template_ipi import TemplateIPIAttack
 
 logger = logging.getLogger(__name__)
@@ -117,6 +120,24 @@ def _resolve_projector(model) -> Tuple[Any, str]:
     )
 
 
+def _projected(out):
+    """The projector's output tensor, whatever container it comes in:
+    a tensor (Qwen visual.merger), a tuple, or a ModelOutput -- Gemma 4's
+    embed_vision is called with return_dict=True and returns a
+    BaseModelOutputWithPooling whose pooler_output is the image in the text
+    model's space (review P2b, B2: the hook used to see nothing on Gemma).
+    Gemma's padded soft-token slots are included in the mean."""
+    if torch.is_tensor(out):
+        return out
+    for attr in ("pooler_output", "last_hidden_state"):
+        t = getattr(out, attr, None)
+        if torch.is_tensor(t):
+            return t
+    if isinstance(out, (tuple, list)) and out and torch.is_tensor(out[0]):
+        return out[0]
+    return None
+
+
 class CrossModalInjectionAttack(BaseAttack):
     """Coordinated visual + textual injection with real Visual Latent Alignment."""
 
@@ -129,19 +150,21 @@ class CrossModalInjectionAttack(BaseAttack):
         processor,
         epsilon: float = 16 / 255,
         alpha: float = 1 / 255,
-        iters: int = 200,
+        iters: int = 500,
         vla_weight: float = 1.0,
         templates: Optional[List[str]] = None,
         template_seed: int = 0,
+        check_every: int = 50,
+        max_seconds: float = 1200.0,
+        opt_max_side: int = 768,
     ):
         """
-        vla_weight : weight on the Visual Latent Alignment term. 0.0
-            ablates VLA entirely, reducing this to the plain pixel attack
-            with a coordinated conditioning prompt -- which is exactly
-            what the previous version of this file did, so that ablation
-            reproduces it and isolates VLA's contribution.
-        epsilon, alpha, iters : passed to the internal pixel attack; same
-            cost profile as pixel_perturbation.py.
+        vla_weight : weight on the Visual Latent Alignment term. 0.0 ablates
+            VLA, reducing the visual half to the plain captioner attack
+            (pixel_perturbation), so CrossInject minus pixel isolates VLA plus
+            the text half.
+        epsilon, alpha, iters, check_every, max_seconds, opt_max_side : as
+            pixel_perturbation (shared objective, attacks/captioner_objective.py).
         """
         self.model = model
         self.processor = processor
@@ -149,16 +172,19 @@ class CrossModalInjectionAttack(BaseAttack):
         self.alpha = alpha
         self.iters = iters
         self.vla_weight = vla_weight
-        self._visual = PixelPerturbationAttack(model, processor, epsilon=epsilon,
-                                               alpha=alpha, iters=iters)
+        self.check_every = check_every
+        self.max_seconds = max_seconds
+        self.opt_max_side = opt_max_side
         self._textual = TemplateIPIAttack(templates=templates, seed=template_seed)
 
     # ------------------------------------------------------------------
     def _target_text_embedding(self, target_text: str, device, dtype) -> torch.Tensor:
-        """Mean input embedding of the attacker's target text -- the point
-        in the shared latent space the visual features are pulled toward."""
+        """Mean input embedding of the target text, no BOS (audit 12.4) --
+        the point in the shared latent space the visual features are pulled
+        toward."""
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        ids = torch.tensor(tokenizer.encode(target_text), device=device, dtype=torch.long)
+        ids = torch.tensor(tokenizer(target_text, add_special_tokens=False)["input_ids"],
+                           device=device, dtype=torch.long)
         with torch.no_grad():
             emb = self.model.get_input_embeddings()(ids)
         return emb.mean(dim=0).to(dtype)
@@ -173,9 +199,22 @@ class CrossModalInjectionAttack(BaseAttack):
         template_idx: Optional[int] = None,
         **kwargs: Any,
     ) -> AttackResult:
+        """P2b, under self-captioning. Visual half: the captioner attack
+        toward the task's target caption, plus VLA (projected visual
+        features pulled toward the target caption's embedding). Textual
+        half: the template-IPI payload, appended to the description. The
+        runner gives the agent <our model's caption of the adversarial
+        image> + <payload> (run_vwa_adv_curated_matrix._victim_caption).
+
+        The earlier 'coordinated prompt' (the text payload inside the
+        optimisation context) is dropped: the captioner never sees the
+        description it is writing, so that context does not exist in the
+        episode."""
+        from .captioner_objective import optimise_caption, target_caption_of
         image = image or base_input.get("image")
         if image is None:
             raise ValueError("CrossModalInjectionAttack needs a base image.")
+        target = target_caption_of(base_input)
 
         # --- Textual half (TGE stand-in: fixed templates, not learned) ---
         text_input = dict(base_input)
@@ -183,148 +222,63 @@ class CrossModalInjectionAttack(BaseAttack):
         if clean_text is not None:
             text_input[injectable_field] = clean_text
         text_result = self._textual.generate(text_input, target_behavior, template_idx=template_idx)
-        adversarial_text = text_result.adversarial_text
 
-        # The visual half is optimised in a context where the textual
-        # payload is ALREADY present, so the two channels reinforce rather
-        # than compete. Retained from the previous version; orthogonal to VLA.
-        visual_prompt = base_input.get("prompt", "Describe this image.")
-        coordinated_prompt = f"{visual_prompt}\n\n{adversarial_text}"
-
-        image_token = getattr(self.processor, "image_token", None)
-        prompt = coordinated_prompt
-        if image_token and image_token not in prompt:
-            prompt = f"{image_token}\n{prompt}"
-
+        # --- Visual half: captioner objective + VLA through a non-detaching hook ---
         device = next(self.model.parameters()).device
-        img = image.convert("RGB")
-        clean = torch.from_numpy(np.array(img).astype("float32") / 255.0)
-        clean = clean.permute(2, 0, 1).unsqueeze(0).to(device)
-        delta = torch.zeros_like(clean, requires_grad=True)
-
-        from .geometry_adapters import get_adapter
-        adapter = get_adapter(self.processor)
-        plan = adapter.plan(clean.shape[-2], clean.shape[-1])
-
-        full_text = f"{prompt} {target_behavior}"
-        prompt_only = self.processor(images=img, text=prompt, return_tensors="pt")
-        prompt_len = prompt_only["input_ids"].shape[1]
-        full_inputs = self.processor(images=img, text=full_text, return_tensors="pt")
-        full_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                       for k, v in full_inputs.items()}
-        labels = full_inputs["input_ids"].clone()
-        labels[:, :prompt_len] = -100
-        full_inputs["use_cache"] = False
-
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        self.model.train()  # engages gradient checkpointing; see pixel_perturbation.py
-        for m in self.model.modules():
-            if isinstance(m, (torch.nn.Dropout, torch.nn.BatchNorm1d,
-                              torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
-                m.eval()
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
-        # --- VLA setup: non-detaching hook on the projector ---
         projector, projector_path = _resolve_projector(self.model)
-        target_embed = self._target_text_embedding(
-            target_behavior, device, next(self.model.parameters()).dtype
-        )
+        target_embed = self._target_text_embedding(target, device, next(self.model.parameters()).dtype)
         captured: Dict[str, Any] = {}
+        vla_hist: List[float] = []
 
         def _hook(module, inp, out):
-            # NOT detached -- the VLA gradient must reach delta through this.
-            # Only an output WITH a gradient path is kept: some projectors
-            # (Gemma's embed_vision) are also called on vision-token ids,
-            # whose output has no path to delta; keeping that call would
-            # make the alignment term silently inert (review 3, #9).
-            t = out[0] if isinstance(out, tuple) else out
+            # Only an output WITH a gradient path is kept (Gemma's embed_vision
+            # is also called on token ids; review 3, #9).
+            t = _projected(out)
             if torch.is_tensor(t) and t.requires_grad:
                 captured["v"] = t
                 captured["n_grad"] = captured.get("n_grad", 0) + 1
             else:
                 captured["n_nograd"] = captured.get("n_nograd", 0) + 1
 
+        def _vla() -> torch.Tensor:
+            v = captured.pop("v", None)
+            if v is None:
+                raise RuntimeError(
+                    f"Projector hook at {projector_path!r} produced no output with a gradient path "
+                    f"({captured.get('n_nograd', 0)} call(s) without one) -- VLA would be silently inert.")
+            v_mean = v.reshape(-1, v.shape[-1]).mean(dim=0)
+            loss = 1.0 - F.cosine_similarity(v_mean.unsqueeze(0).float(),
+                                             target_embed.unsqueeze(0).float()).squeeze(0)
+            vla_hist.append(float(loss.detach()))
+            return self.vla_weight * loss
+
         handle = projector.register_forward_hook(_hook)
-
-        vla_start = vla_end = ce_end = None
-        proj_calls = None
         try:
-            for step in range(self.iters):
-                adv = (clean + delta).clamp(0, 1)
-                inputs = dict(full_inputs)
-                # move only tensors -- Gemma's adapter also returns
-                # num_soft_tokens_per_image as a plain Python list
-                _ai = adapter.build(adv.squeeze(0), plan)
-                inputs.update({k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                               for k, v in _ai.items()})
-                inputs["labels"] = labels
-
-                outputs = self.model(**inputs)
-                ce_loss = outputs.loss
-
-                v = captured.get("v")
-                if v is None:
-                    raise RuntimeError(
-                        f"Projector hook at {projector_path!r} produced no output with a gradient "
-                        f"path ({captured.get('n_nograd', 0)} call(s) without one) -- VLA would be "
-                        "silently inert. Fix the projector path before trusting any result."
-                    )
-                if step == 0:
-                    proj_calls = (captured.get("n_grad", 0), captured.get("n_nograd", 0))
-                v_mean = v.reshape(-1, v.shape[-1]).mean(dim=0)
-                vla_loss = 1.0 - F.cosine_similarity(
-                    v_mean.unsqueeze(0).float(), target_embed.unsqueeze(0).float()
-                ).squeeze(0)
-
-                loss = ce_loss + self.vla_weight * vla_loss
-                loss.backward()
-
-                if step == 0:
-                    vla_start = float(vla_loss.detach())
-                vla_end, ce_end = float(vla_loss.detach()), float(ce_loss.detach())
-
-                with torch.no_grad():
-                    delta.grad.sign_()
-                    delta.data = delta.data - self.alpha * delta.grad
-                    delta.data.clamp_(-self.epsilon, self.epsilon)
-                    delta.data = torch.clamp(clean + delta, 0, 1) - clean
-                    delta.grad.zero_()
-
-                del outputs, loss, ce_loss, vla_loss
-                captured.clear()
-                torch.cuda.empty_cache()
+            adv_image, meta = optimise_caption(
+                self.model, self.processor, image, target,
+                epsilon=self.epsilon, alpha=self.alpha, iters=self.iters,
+                check_every=self.check_every, max_seconds=self.max_seconds,
+                opt_max_side=self.opt_max_side,
+                extra_loss=_vla if self.vla_weight else None)
         finally:
             handle.remove()
 
-        adv_image = self._visual._tensor_to_pil((clean + delta).clamp(0, 1))
-
+        meta.update({
+            "vla_weight": self.vla_weight,
+            "projector_path": projector_path,
+            # If vla_loss_end is not below vla_loss_start, VLA did not optimise.
+            "vla_loss_start": vla_hist[0] if vla_hist else None,
+            "vla_loss_end": vla_hist[-1] if vla_hist else None,
+            "textual": text_result.metadata,
+            "tge_faithful": False,  # fixed templates, not a learned generator
+        })
         return AttackResult(
             attack_name=self.name,
             modality=self.modality,
             adversarial_image=adv_image,
-            adversarial_text=adversarial_text,
+            adversarial_text=text_result.adversarial_text,
             target_behavior=target_behavior,
-            metadata={
-                "vla_weight": self.vla_weight,
-                "projector_path": projector_path,
-                # (calls with a gradient path, calls without) at step 0.
-                "projector_calls_grad_nograd": proj_calls,
-                # If vla_loss_end is not below vla_loss_start, VLA did not
-                # actually optimise anything and the result is not CrossInject.
-                "vla_loss_start": vla_start,
-                "vla_loss_end": vla_end,
-                "ce_loss_end": ce_end,
-                "epsilon": self.epsilon,
-                "alpha": self.alpha,
-                "iters": self.iters,
-                "adapter": adapter.name,
-                "target_resolution": (plan.target_h, plan.target_w),
-                "textual": text_result.metadata,
-                "coordinated_prompt": coordinated_prompt,
-                "tge_faithful": False,  # fixed templates, not a learned generator
-            },
+            metadata=meta,
         )
 
     @staticmethod

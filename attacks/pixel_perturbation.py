@@ -4,6 +4,14 @@ attacks/pixel_perturbation.py
 Adversarial pixel perturbation (Table 3.2, visual baseline).
 Qi et al. 2023; BIM (Kurakin et al.) family, l_inf bounded.
 
+P2b (5 Oct): retargeted at the self-captioner -- VWA-Adv's own captioner
+attack, white-box on the agent model. The objective, sizes and budget live in
+attacks/captioner_objective.py; this class is a thin wrapper. The LLaVA AnyRes
+geometry below is kept only because attacks/geometry_adapters.py's AnyRes
+adapter reuses it.
+
+(Earlier notes, kept for the LLaVA port:)
+
 ANYRES TILING (faithful, not scoped-down): a real GPU run confirmed
 LLaVA-NeXT's processor splits ANY image -- including a 336x336 synthetic
 test square -- into a base/global patch plus one or more grid tiles
@@ -156,148 +164,49 @@ class _AnyResGeometry:
 
 
 class PixelPerturbationAttack(BaseAttack):
-    """BIM-style l_inf pixel perturbation. Requires the REAL model + processor."""
+    """BIM-style l_inf pixel perturbation against the SELF-CAPTIONER (P2b).
+
+    Retargeted (decision 30 Sep): the image is optimised so that the agent
+    model, captioning it with the episode's own captioning request, writes
+    the task's adversarial target caption -- VWA-Adv's own captioner
+    attack, white-box on our model. See attacks/captioner_objective.py for
+    what matches the paper and what does not. The earlier objective (the
+    goal text, after a raw untemplated prompt, on the image alone; audit
+    12.6) is gone: it optimised a context the agent never sees."""
 
     name = "pixel_perturbation"
     modality = AttackModality.VISUAL
 
-    def __init__(self, model, processor, epsilon: float = 16 / 255, alpha: float = 1 / 255, iters: int = 200):
+    def __init__(self, model, processor, epsilon: float = 16 / 255, alpha: float = 1 / 255,
+                 iters: int = 500, check_every: int = 50, max_seconds: float = 1200.0,
+                 opt_max_side: int = 768):
         self.model = model
         self.processor = processor
         self.epsilon = epsilon
         self.alpha = alpha
         self.iters = iters
+        self.check_every = check_every
+        self.max_seconds = max_seconds
+        self.opt_max_side = opt_max_side
 
     def generate(
         self,
         base_input: Dict[str, Any],
         target_behavior: str,
         image: Optional[Image.Image] = None,
-        prompt: Optional[str] = None,
         **kwargs,
     ) -> AttackResult:
+        from .captioner_objective import optimise_caption, target_caption_of
         image = image or base_input.get("image")
         if image is None:
             raise ValueError("PixelPerturbationAttack needs a base image (pass image= or base_input['image']).")
-
-        prompt = prompt or base_input.get("prompt", "Describe this image.")
-
-        image_token = getattr(self.processor, "image_token", None)
-        if image_token and image_token not in prompt:
-            prompt = f"{image_token}\n{prompt}"
-
-        device = next(self.model.parameters()).device
-
-        image = image.convert("RGB")
-        clean = torch.from_numpy(np.array(image).astype("float32") / 255.0)
-        clean = clean.permute(2, 0, 1).unsqueeze(0).to(device)
-        delta = torch.zeros_like(clean, requires_grad=True)
-
-        # ARCHITECTURE-AGNOSTIC PREPROCESSING. This block previously
-        # required image_grid_pinpoints + crop_size, which only
-        # LLaVA-NeXT exposes -- verified on the installed weights:
-        #   llava-v1.6-mistral-7b   pinpoints=True   crop=True
-        #   InternVL3-8B-hf         pinpoints=False  crop=True
-        #   Qwen3-VL-8B-Instruct    pinpoints=False  crop=True
-        # so this attack raised before doing any work on two of the
-        # three models, restricting the pixel-space attacks to the least
-        # capable one. attacks/geometry_adapters.py dispatches on the
-        # processor's own attributes and reproduces each architecture's
-        # real preprocessing differentiably; get_adapter() raises for an
-        # unrecognised processor rather than guessing.
-        from .geometry_adapters import get_adapter
-        adapter = get_adapter(self.processor)
-        orig_h, orig_w = clean.shape[-2], clean.shape[-1]
-        plan = adapter.plan(orig_h, orig_w)
-
-        full_text = f"{prompt} {target_behavior}"
-        prompt_only = self.processor(images=image, text=prompt, return_tensors="pt")
-        prompt_len = prompt_only["input_ids"].shape[1]
-        full_inputs = self.processor(images=image, text=full_text, return_tensors="pt")
-        full_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in full_inputs.items()}
-        labels = full_inputs["input_ids"].clone()
-        labels[:, :prompt_len] = -100
-        full_inputs["use_cache"] = False  # single forward pass, no incremental
-        # decode -- building a KV cache here is pure wasted memory.
-
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-
-        # Confirmed the eval()-mode gating gotcha flagged when this fix was
-        # first written (job 34350 OOM'd at ~identical memory with the flag
-        # set True -- checkpointing wasn't actually engaging). Real HF
-        # decoder layers gate the checkpoint branch on self.training, not
-        # just the outer is_gradient_checkpointing flag. Switching to
-        # train() so that gate opens; LayerNorm (what this model uses, not
-        # BatchNorm) doesn't depend on train/eval mode at all, so the only
-        # real hazard is Dropout -- forced back to eval behavior explicitly
-        # below rather than trusted to not matter.
-        self.model.train()
-        for module in self.model.modules():
-            if isinstance(module, (torch.nn.Dropout, torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
-                module.eval()
-
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-
-        # Direct runtime check, not just the outer flag -- find one real
-        # decoder layer and confirm ITS training state, since that's what
-        # actually gates the checkpoint branch during forward().
-        checkpointing_confirmed = "<no decoder layer found to check>"
-        for module in self.model.modules():
-            if type(module).__name__.endswith("DecoderLayer"):
-                checkpointing_confirmed = (
-                    f"found {type(module).__name__}, training={module.training}, "
-                    f"model.is_gradient_checkpointing={getattr(self.model, 'is_gradient_checkpointing', '<attr not present>')}"
-                )
-                break
-        print(f"gradient checkpointing status: {checkpointing_confirmed}")
-
-        for _ in range(self.iters):
-            adv_tensor = (clean + delta).clamp(0, 1)
-            # build() returns every model input the preprocessing
-            # produces -- for Qwen that includes image_grid_thw, not just
-            # pixel_values -- so update() rather than assigning one key.
-            adv_inputs = adapter.build(adv_tensor.squeeze(0), plan)
-
-            inputs = dict(full_inputs)
-            # move only tensors -- Gemma's adapter also returns
-            # num_soft_tokens_per_image as a plain Python list
-            _ai = adv_inputs
-            inputs.update({k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                           for k, v in _ai.items()})
-            inputs["labels"] = labels
-
-            outputs = self.model(**inputs)
-            loss = outputs.loss
-            loss.backward()
-
-            with torch.no_grad():
-                delta.grad.sign_()
-                delta.data = delta.data - self.alpha * delta.grad
-                delta.data.clamp_(-self.epsilon, self.epsilon)
-                delta.data = torch.clamp(clean + delta, 0, 1) - clean
-                delta.grad.zero_()
-
-            del outputs, loss
-            torch.cuda.empty_cache()
-
-        adv_image_final = self._tensor_to_pil((clean + delta).clamp(0, 1))
-
-        return AttackResult(
-            attack_name=self.name,
-            modality=self.modality,
-            adversarial_image=adv_image_final,
-            target_behavior=target_behavior,
-            metadata={
-                "epsilon": self.epsilon,
-                "alpha": self.alpha,
-                "iters": self.iters,
-                "adapter": adapter.name,
-                "target_resolution": (plan.target_h, plan.target_w),
-                "used_real_hf_geometry": _REAL_HF_GEOMETRY,
-            },
-        )
+        target = target_caption_of(base_input)
+        adv, meta = optimise_caption(
+            self.model, self.processor, image, target,
+            epsilon=self.epsilon, alpha=self.alpha, iters=self.iters, check_every=self.check_every,
+            max_seconds=self.max_seconds, opt_max_side=self.opt_max_side)
+        return AttackResult(attack_name=self.name, modality=self.modality, adversarial_image=adv,
+                            adversarial_text=None, target_behavior=target_behavior, metadata=meta)
 
     def _build_anyres_patches(self, image_tensor: torch.Tensor, geometry: "_AnyResGeometry") -> torch.Tensor:
         img_proc = self.processor.image_processor
