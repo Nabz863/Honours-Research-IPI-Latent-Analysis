@@ -151,7 +151,7 @@ class CrossModalInjectionAttack(BaseAttack):
         epsilon: float = 16 / 255,
         alpha: float = 1 / 255,
         iters: int = 500,
-        vla_weight: float = 1.0,
+        vla_weight: float = 30.0,
         templates: Optional[List[str]] = None,
         template_seed: int = 0,
         check_every: int = 50,
@@ -162,7 +162,18 @@ class CrossModalInjectionAttack(BaseAttack):
         vla_weight : weight on the Visual Latent Alignment term. 0.0 ablates
             VLA, reducing the visual half to the plain captioner attack
             (pixel_perturbation), so CrossInject minus pixel isolates VLA plus
-            the text half.
+            the text half. Default 30, by the rule fixed before calibrating:
+            the smallest weight at which the alignment loss (1 - cos) falls on
+            both models while the caption cross-entropy still falls.
+            Calibration of 8 Oct (p2b/vla_calibration.py, 2 tasks x 100
+            iterations, weights 1/10/30/100), mean change in the alignment
+            loss: Qwen3-VL +0.021 / +0.008 / -0.098 / -0.175, Gemma 4 -0.001 /
+            -0.005 / -0.030 / -0.086; mean caption cross-entropy fell at every
+            weight. Production runs 500 iterations, not 100. With sign-gradient
+            steps only the ratio of the two gradients matters, so a larger
+            weight risks the alignment term overriding the caption target;
+            check exact/prefix-match rates against pixel_perturbation.
+            Note: loss_start/loss_end include the weighted alignment term.
         epsilon, alpha, iters, check_every, max_seconds, opt_max_side : as
             pixel_perturbation (shared objective, attacks/captioner_objective.py).
         """
