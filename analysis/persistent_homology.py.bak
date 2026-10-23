@@ -1,0 +1,361 @@
+"""
+analysis/persistent_homology.py
+-------------------------------
+RQ (latent topology, after Fay et al.): does an attack change the SHAPE of
+the representation cloud, not just its mean position? Displacement (geometry.py)
+measures where the centroid moved; persistent homology asks whether the
+connectivity and loop structure of the episode cloud differ between the clean
+and attacked conditions.
+
+METHOD
+    Per (results_dir, layer):
+      * point cloud per condition -- one activation vector per episode, at the
+        analysis layer, mean-over-turns (the geometry.py convention). Condition
+        is 'clean' or an attack name.
+      * standardise: z-score each feature on the CLEAN cloud's statistics, so
+        clean and attacked sit in one frame; then PCA to a bounded dimension
+        (default 50) for tractable Vietoris-Rips. Both steps are reported.
+      * persistence diagrams H0 (connected components) and H1 (loops) via
+        Vietoris-Rips. ripser if installed; otherwise a self-contained
+        union-find computes H0 exactly and H1 is reported as unavailable (never
+        guessed).
+      * summaries per condition/dim: feature count, total persistence
+        (sum of death-birth over finite features), max persistence.
+      * clean vs each attack: the Betti curve (feature count as a function of
+        radius) is compared by L2 distance, per homology dimension, on a shared
+        radius grid. Significance is a LABEL-PERMUTATION null: pool the two
+        clouds, split at random into the same two sizes, recompute the curve
+        distance; p = (1 + #{null >= observed}) / (1 + n_perm). This asks
+        whether clean and attacked are topologically more different than a
+        random partition of the same points -- the mean-shift is not factored
+        out, so a pure translation can register, which is stated.
+      * if persim is installed, the bottleneck and (1-)Wasserstein distances
+        between the clean and attacked diagrams are also reported, with the
+        same permutation null on the bottleneck distance.
+
+    Bounded by design: at most --max_points episodes per cloud (subsampled with
+    a fixed seed), --pca_dim features, --grid radii, --n_perm permutations.
+
+Usage
+    python3 analysis/persistent_homology.py \\
+        --results_dir final_agentdojo_qwen3vl --layer 31 \\
+        --out analysis_out/homology_qwen3vl.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+import numpy as np
+
+try:
+    import torch
+except ImportError:
+    sys.exit("torch required")
+
+# geometry.py sits next to this file; running `python3 analysis/<this>.py`
+# puts analysis/ on sys.path[0], so a bare import resolves. Belt and braces
+# for `python -m` and tests:
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from geometry import load_rows, tensor_path, load_episode, CLEAN_NAME  # noqa: E402
+
+try:
+    from ripser import ripser as _ripser
+    HAVE_RIPSER = True
+except Exception:
+    HAVE_RIPSER = False
+
+try:
+    from persim import bottleneck as _bottleneck, wasserstein as _wasserstein
+    HAVE_PERSIM = True
+except Exception:
+    HAVE_PERSIM = False
+
+
+# ---------------------------------------------------------------------------
+# point clouds
+# ---------------------------------------------------------------------------
+
+def clouds(results_dir, layer, turn_strategy="mean"):
+    """{condition_label: np.float32[n_episodes, d]} with 'clean' plus one
+    entry per attack_name. Undefended rows only; errored rows skipped."""
+    rows = load_rows(results_dir)
+    by_cond = defaultdict(list)
+    for r in rows:
+        if r.get("error"):
+            continue
+        if r.get("defense_name") not in (None, "none"):
+            continue
+        cond = r.get("condition")
+        if cond == "clean":
+            label = CLEAN_NAME
+        elif cond == "attacked":
+            label = r.get("attack_name")
+        else:
+            continue
+        acts = load_episode(tensor_path(r), turn_strategy)
+        if acts is None or layer not in acts:
+            continue
+        by_cond[label].append(np.asarray(acts[layer], dtype=np.float64))
+    return {k: np.vstack(v) for k, v in by_cond.items() if v}
+
+
+def preprocess(clean, other, pca_dim, seed):
+    """z-score on clean stats, then PCA (fit on the pooled set) to pca_dim.
+    Returns (clean_z_pca, other_z_pca, info)."""
+    mu = clean.mean(0)
+    sd = clean.std(0)
+    sd[sd < 1e-8] = 1.0
+    cz = (clean - mu) / sd
+    oz = (other - mu) / sd
+    pooled = np.vstack([cz, oz])
+    k = int(min(pca_dim, pooled.shape[0] - 1, pooled.shape[1]))
+    info = {"pca_dim": k, "n_clean": len(clean), "n_other": len(other)}
+    if k < 1:
+        return cz, oz, info
+    # PCA via SVD on the mean-centred pooled matrix (no sklearn dependency)
+    pc = pooled - pooled.mean(0)
+    _, _, vt = np.linalg.svd(pc, full_matrices=False)
+    comp = vt[:k]
+    return (cz - pooled.mean(0)) @ comp.T, (oz - pooled.mean(0)) @ comp.T, info
+
+
+def subsample(x, n, rng):
+    if len(x) <= n:
+        return x
+    idx = rng.choice(len(x), size=n, replace=False)
+    return x[idx]
+
+
+# ---------------------------------------------------------------------------
+# persistence diagrams
+# ---------------------------------------------------------------------------
+
+def _h0_union_find(points):
+    """Exact H0 persistence for a Vietoris-Rips filtration: single-linkage
+    merge distances. Births are all 0; deaths are the n-1 merge radii; one
+    component survives to infinity. Returns np.array[[0, death], ...] with a
+    trailing [0, inf]."""
+    n = len(points)
+    if n <= 1:
+        return np.array([[0.0, np.inf]])
+    # condensed pairwise distances, edges sorted ascending
+    d = points[:, None, :] - points[None, :, :]
+    dist = np.sqrt((d * d).sum(-1))
+    iu = np.triu_indices(n, k=1)
+    order = np.argsort(dist[iu])
+    ei, ej = iu[0][order], iu[1][order]
+    ew = dist[iu][order]
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    deaths = []
+    for a, b, w in zip(ei, ej, ew):
+        ra, rb = find(int(a)), find(int(b))
+        if ra != rb:
+            parent[ra] = rb
+            deaths.append(float(w))        # a component dies when it merges
+            if len(deaths) == n - 1:
+                break
+    return np.array([[0.0, x] for x in deaths] + [[0.0, np.inf]])
+
+
+def diagrams(points, maxdim=1):
+    """{0: array[[b,d],...], 1: array or None}. ripser when available (H0+H1),
+    else union-find H0 and H1 unavailable."""
+    if HAVE_RIPSER and len(points) >= 2:
+        dg = _ripser(points, maxdim=maxdim)["dgms"]
+        return {d: dg[d] for d in range(len(dg))}
+    return {0: _h0_union_find(points), 1: None}
+
+
+def _finite(dgm):
+    """Drop features with a non-finite death (the infinite H0 component).
+    persim's bottleneck/Wasserstein ignore them anyway, with a warning."""
+    if dgm is None or len(dgm) == 0:
+        return np.empty((0, 2))
+    return dgm[np.isfinite(dgm[:, 1])]
+
+
+def summarise(dgm):
+    """feature count / total persistence / max persistence over FINITE
+    features (the infinite H0 component is dropped)."""
+    if dgm is None or len(dgm) == 0:
+        return {"n": 0, "total_persistence": 0.0, "max_persistence": 0.0}
+    life = dgm[:, 1] - dgm[:, 0]
+    finite = life[np.isfinite(life)]
+    if finite.size == 0:
+        return {"n": 0, "total_persistence": 0.0, "max_persistence": 0.0}
+    return {"n": int(finite.size),
+            "total_persistence": float(finite.sum()),
+            "max_persistence": float(finite.max())}
+
+
+def betti_curve(dgm, radii):
+    """#features alive at each radius: birth <= r < death (infinite deaths
+    count as alive everywhere)."""
+    if dgm is None or len(dgm) == 0:
+        return np.zeros(len(radii))
+    b, dth = dgm[:, 0], dgm[:, 1]
+    out = np.empty(len(radii))
+    for i, r in enumerate(radii):
+        out[i] = int(np.sum((b <= r) & (r < dth)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# clean-vs-attack comparison with a permutation null
+# ---------------------------------------------------------------------------
+
+def _radius_grid(a, b, grid):
+    pooled = np.vstack([a, b])
+    d = pooled[:, None, :] - pooled[None, :, :]
+    dmax = float(np.sqrt((d * d).sum(-1)).max())
+    # Rips H1 features die well before the diameter; cap the grid at ~60% of
+    # it so the curve spends resolution where features live.
+    return np.linspace(0.0, 0.6 * dmax if dmax > 0 else 1.0, grid)
+
+
+def compare(clean, other, radii, n_perm, maxdim, rng):
+    dg_c, dg_o = diagrams(clean, maxdim), diagrams(other, maxdim)
+    dims = sorted(set(dg_c) | set(dg_o))
+    obs = {}
+    for dim in dims:
+        cc = betti_curve(dg_c.get(dim), radii)
+        co = betti_curve(dg_o.get(dim), radii)
+        obs[dim] = float(np.sqrt(np.sum((cc - co) ** 2)))
+
+    bott = {}
+    if HAVE_PERSIM:
+        for dim in dims:
+            if dg_c.get(dim) is not None and dg_o.get(dim) is not None:
+                try:
+                    fc, fo = _finite(dg_c[dim]), _finite(dg_o[dim])
+                    bott[dim] = {
+                        "bottleneck": float(_bottleneck(fc, fo)),
+                        "wasserstein": float(_wasserstein(fc, fo)),
+                    }
+                except Exception:
+                    pass
+
+    # label-permutation null on the Betti-curve distance (and bottleneck)
+    pooled = np.vstack([clean, other])
+    nA = len(clean)
+    null_betti = {dim: [] for dim in dims}
+    null_bott = {dim: [] for dim in bott}
+    for _ in range(n_perm):
+        perm = rng.permutation(len(pooled))
+        g1, g2 = pooled[perm[:nA]], pooled[perm[nA:]]
+        d1, d2 = diagrams(g1, maxdim), diagrams(g2, maxdim)
+        for dim in dims:
+            b1 = betti_curve(d1.get(dim), radii)
+            b2 = betti_curve(d2.get(dim), radii)
+            null_betti[dim].append(float(np.sqrt(np.sum((b1 - b2) ** 2))))
+        for dim in bott:
+            if d1.get(dim) is not None and d2.get(dim) is not None:
+                try:
+                    null_bott[dim].append(float(_bottleneck(_finite(d1[dim]), _finite(d2[dim]))))
+                except Exception:
+                    pass
+
+    res = {"betti_l2": {}, "summaries": {
+        "clean": {d: summarise(dg_c.get(d)) for d in dims},
+        "other": {d: summarise(dg_o.get(d)) for d in dims}}}
+    for dim in dims:
+        nn = np.array(null_betti[dim], dtype=float)
+        p = float((1 + np.sum(nn >= obs[dim])) / (1 + nn.size)) if nn.size else None
+        res["betti_l2"][dim] = {"observed": obs[dim],
+                                "null_mean": float(nn.mean()) if nn.size else None,
+                                "null_p95": float(np.percentile(nn, 95)) if nn.size else None,
+                                "p_perm": p}
+    if bott:
+        res["diagram_distance"] = {}
+        for dim in bott:
+            nn = np.array(null_bott.get(dim, []), dtype=float)
+            p = float((1 + np.sum(nn >= bott[dim]["bottleneck"])) / (1 + nn.size)) if nn.size else None
+            res["diagram_distance"][dim] = {**bott[dim], "bottleneck_p_perm": p}
+    return res
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results_dir", required=True)
+    ap.add_argument("--layer", type=int, default=31)
+    ap.add_argument("--turn_strategy", default="mean", choices=["first", "mean", "last"])
+    ap.add_argument("--pca_dim", type=int, default=50)
+    ap.add_argument("--max_points", type=int, default=150,
+                    help="cap per cloud; Vietoris-Rips is superlinear")
+    ap.add_argument("--grid", type=int, default=50, help="radii in the Betti curve")
+    ap.add_argument("--n_perm", type=int, default=100)
+    ap.add_argument("--maxdim", type=int, default=1, help="1 = H0 and H1")
+    ap.add_argument("--min_points", type=int, default=10)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default=None)
+    a = ap.parse_args()
+
+    if not HAVE_RIPSER:
+        print("[warn] ripser not installed -- H0 via union-find only, H1 "
+              "unavailable. Install with "
+              "`venv/bin/pip install --break-system-packages ripser persim`.\n")
+    if not HAVE_PERSIM:
+        print("[warn] persim not installed -- bottleneck/Wasserstein diagram "
+              "distances skipped (Betti-curve test still runs).\n")
+
+    cl = clouds(a.results_dir, a.layer, a.turn_strategy)
+    if CLEAN_NAME not in cl:
+        sys.exit(f"no clean cloud at layer {a.layer} in {a.results_dir}")
+    clean = cl[CLEAN_NAME]
+    print(f"\n=== persistent homology  ({a.results_dir}, layer {a.layer}, "
+          f"turns={a.turn_strategy}) ===")
+    print(f"backend: {'ripser (H0+H1)' if HAVE_RIPSER else 'union-find (H0 only)'}"
+          f"{' + persim' if HAVE_PERSIM else ''}")
+    print(f"clean cloud: {len(clean)} episodes")
+
+    rng = np.random.default_rng(a.seed)
+    out = {"config": vars(a),
+           "backend": {"ripser": HAVE_RIPSER, "persim": HAVE_PERSIM},
+           "per_attack": {}}
+    for label, pts in sorted(cl.items()):
+        if label == CLEAN_NAME:
+            continue
+        if len(clean) < a.min_points or len(pts) < a.min_points:
+            print(f"  {label:26s} SKIP (clean {len(clean)}, attack {len(pts)} "
+                  f"< min_points {a.min_points})")
+            continue
+        cz, oz, info = preprocess(clean, pts, a.pca_dim, a.seed)
+        cz = subsample(cz, a.max_points, rng)
+        oz = subsample(oz, a.max_points, rng)
+        radii = _radius_grid(cz, oz, a.grid)
+        res = compare(cz, oz, radii, a.n_perm, a.maxdim, rng)
+        res["preprocess"] = info
+        out["per_attack"][label] = res
+        line = []
+        for dim, v in sorted(res["betti_l2"].items()):
+            p = v["p_perm"]
+            star = " *" if (p is not None and p < 0.05) else ""
+            line.append(f"H{dim} L2={v['observed']:.2f} "
+                        f"p={'n/a' if p is None else f'{p:.3g}'}{star}")
+        print(f"  {label:26s} " + "   ".join(line))
+
+    if a.out:
+        os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+        json.dump(out, open(a.out, "w"), indent=2, default=float)
+        print(f"\nwrote {a.out}")
+    print("\nnote: the permutation null does not remove the mean shift, so a "
+          "pure translation can register as a topological difference. Read "
+          "alongside geometry.py's displacement, not instead of it.")
+
+
+if __name__ == "__main__":
+    main()

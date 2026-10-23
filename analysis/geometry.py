@@ -32,6 +32,10 @@ import os
 import re
 import sys
 from collections import defaultdict
+from pathlib import Path as _P
+
+# repo root on the path so `from experiments...` resolves however this is run
+sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
 
 import numpy as np
 
@@ -123,30 +127,58 @@ def user_task_group(task_id):
     so search (not match) for the '<suite>_user_task_N' prefix; anchoring
     at the string start fails because the suite comes first, which would
     silently degrade grouping to one-group-per-episode."""
-    m = re.search(r"^(.*user_task_\d+)", str(task_id))
-    return m.group(1) if m else str(task_id)
+    s = str(task_id)
+    m = re.search(r"^(.*user_task_\d+)", s)
+    if m:
+        return m.group(1)
+    # VWA-Adv (cleanup-plan A2): 'reddit_36_wrong_object_cap_1' and its
+    # '_2' sibling are variants of ONE base task, 'reddit_36' (the runner's
+    # task.base). Without this every variant is its own group, so the probe
+    # can score a held-out variant by its sibling and RQ2's per-task collapse
+    # does nothing on VWA. Anything matching neither pattern is its own group.
+    m = re.match(r"^(.*?_\d+)_", s)          # first '<...>_<N>' prefix; multi-word sites ok
+    return m.group(1) if m else s
 
 
-def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=False,
-                  include_errored=False):
-    """
-    include_errored: default False. A row carrying an `error` did not produce
-    an episode that can be trusted as its label claims -- e.g. "no cached
-    payload" episodes RAN against the clean image, so their activations are
-    real but the attack was never delivered. Set True only for a deliberate
-    analysis of failed episodes.
+def _avg_ranks(a):
+    """1-based ranks with ties given their average rank (scipy.stats.rankdata
+    'average'), numpy-only so the effect size needs no scipy."""
+    a = np.asarray(a, dtype=float)
+    order = np.argsort(a, kind="mergesort")
+    ranks = np.empty(len(a))
+    sa = a[order]
+    i = 0
+    while i < len(a):
+        j = i
+        while j + 1 < len(a) and sa[j + 1] == sa[i]:
+            j += 1
+        ranks[order[i:j + 1]] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    return ranks
 
-    results_dirs are read IN PRIORITY ORDER. If two directories contain the
-    same (episode, attack), the FIRST is kept and the collision is reported.
-    """
+
+def matched_rank_biserial(diff):
+    """Matched-pairs rank-biserial r = (R+ - R-) / (R+ + R-) over the ranks of
+    the non-zero |differences| -- the effect size that goes with the Wilcoxon
+    signed-rank test (Kerby 2014), as chapter 3 states. NOT the sign statistic
+    (n+ - n-)/n, which ignores magnitude and can disagree with the test in sign."""
+    d = np.asarray(diff, dtype=float)
+    if not np.all(np.isfinite(d)):
+        return None        # scipy's Wilcoxon gives p=nan here; never a silent number
+    d = d[d != 0]
+    if d.size == 0:
+        return 0.0
+    r = _avg_ranks(np.abs(d))
+    return float((r[d > 0].sum() - r[d < 0].sum()) / r.sum())
+
+
+def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=False):
     rows = []
     for d in results_dirs:
         rows.extend(load_rows(d))
 
     by_key = defaultdict(dict)
     missing, loaded, errored = 0, 0, 0
-    skipped_error, collisions = 0, 0
-    collision_examples = []
 
     for r in rows:
         # Defended rows carry the SAME attack_name as undefended ones, so
@@ -154,20 +186,7 @@ def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=Fa
         # any directory holding both. Undefended rows only, unless the
         # caller asks otherwise -- the same fault was found and fixed in
         # analysis/stats.py.
-        # The defence may be recorded under any of several keys -- a sampled
-        # row from vwa_adv_qwen3vl_def2 carried no `defense_name` at all -- and
-        # defended sample_ids always contain "_defended_". Check both, so a
-        # key-name mismatch cannot silently pass defended rows as undefended.
-        _defense = (r.get("defense_name") or r.get("defense")
-                    or r.get("defence_name") or r.get("defence"))
-        _is_defended = (_defense not in (None, "none")) or \
-            ("_defended_" in str(r.get("sample_id", "")))
-        if not include_defended and _is_defended:
-            continue
-        # A row carrying an error is not a trustworthy episode of what its
-        # label says. See the build_dataset docstring.
-        if r.get("error") and not include_errored:
-            skipped_error += 1
+        if not include_defended and (r.get("defense_name") not in (None, "none")):
             continue
         attack = r.get("attack_name")
         p = tensor_path(r)
@@ -175,39 +194,16 @@ def build_dataset(results_dirs, turn_strategy, verbose=True, include_defended=Fa
             missing += 1
             continue
         acts = load_episode(p, turn_strategy)
-        # Empty counts as unreadable. Job 61500 wrote ~1.5 KB archives holding
-        # an empty list; `is None` alone let those through. len() rather than
-        # truthiness, because truthiness on a multi-element Tensor raises.
-        if acts is None or (hasattr(acts, "__len__") and len(acts) == 0):
+        if acts is None:
             errored += 1
             continue
-        _k = episode_key(r)
-        if attack in by_key[_k]:
-            # Same (episode, attack) already loaded from an earlier directory.
-            # Keep the first -- directories are read in priority order -- and
-            # report, instead of silently overwriting as this code used to.
-            collisions += 1
-            if len(collision_examples) < 5:
-                collision_examples.append(
-                    (str(_k), attack, by_key[_k][attack]["row"].get("_results_dir"),
-                     r.get("_results_dir")))
-            continue
-        by_key[_k][attack] = {"acts": acts, "row": r}
+        by_key[episode_key(r)][attack] = {"acts": acts, "row": r}
         loaded += 1
 
     if verbose:
         total = len(rows)
         print("[join] rows=%d  tensors_loaded=%d  missing_file=%d  unreadable=%d"
-              "  skipped_error_rows=%d  cross_dir_collisions=%d"
-              % (total, loaded, missing, errored, skipped_error, collisions))
-        if collisions:
-            print("[join] WARNING: %d (episode, attack) pairs appeared in more "
-                  "than one results dir. The FIRST dir's copy was kept; "
-                  "the order you pass directories in decides which run's data "
-                  "is analysed. Examples:" % collisions)
-            for _k, _a, _kept, _dropped in collision_examples:
-                print("         %s / %s  kept %s, dropped %s"
-                      % (_k, _a, _kept, _dropped))
+              % (total, loaded, missing, errored))
         if total and loaded / total < 0.9:
             print("[join] WARNING: join rate %.1f%% -- every downstream number "
                   "is computed on this subset only." % (100.0 * loaded / total))
@@ -265,6 +261,149 @@ def per_condition_geometry(paired):
                 "cosine_std": float(np.nanstd(arr[:, 2])),
             }
     return summary
+
+
+def per_condition_geometry_by_outcome(paired):
+    """RQ1's central question: do attacks that FAIL behaviourally still move
+    the representation? Same ||dh||/normalised/cosine as per_condition_geometry,
+    but split by the attacked episode's asr_success (True / False / None=unscored).
+    Keyed attack -> outcome -> layer. The reportable claim is that failed
+    attacks displace the state well above zero, so an injection leaves a
+    signature even when the agent does not act on it."""
+    buckets = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for _, conds in paired.items():
+        clean = conds[CLEAN_NAME]["acts"]
+        for attack, entry in conds.items():
+            if attack == CLEAN_NAME:
+                continue
+            # audit register: scoring_error_final rows are unscored, not failures
+            s = None if entry["row"].get("scoring_error_final") else entry["row"].get("asr_success")
+            outcome = "success" if s is True else ("failure" if s is False else "unscored")
+            for layer, h_adv in entry["acts"].items():
+                h_cln = clean.get(layer)
+                if h_cln is None or h_cln.shape != h_adv.shape:
+                    continue
+                d = h_adv - h_cln
+                nd = float(np.linalg.norm(d))
+                base = float(np.linalg.norm(h_cln))
+                buckets[attack][outcome][layer].append(
+                    (nd, nd / base if base else float("nan"), cosine(h_adv, h_cln)))
+
+    out = {}
+    for attack, outcomes in buckets.items():
+        out[attack] = {}
+        for outcome, layers in outcomes.items():
+            out[attack][outcome] = {}
+            for layer, vals in sorted(layers.items()):
+                arr = np.array(vals, dtype=np.float64)
+                out[attack][outcome][layer] = {
+                    "n": int(arr.shape[0]),
+                    "delta_mean": float(np.nanmean(arr[:, 0])),
+                    "delta_std": float(np.nanstd(arr[:, 0])),
+                    "delta_median": float(np.nanmedian(arr[:, 0])),
+                    "delta_norm_mean": float(np.nanmean(arr[:, 1])),
+                    "cosine_mean": float(np.nanmean(arr[:, 2])),
+                }
+    return out
+
+
+def _load_turn(path, t):
+    """{layer: np.float32[d]} for a single turn index, or None."""
+    try:
+        turns = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        turns = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(turns, list) or not (0 <= t < len(turns)) or not isinstance(turns[t], dict):
+        return None
+    return {int(L): v.detach().float().cpu().numpy() for L, v in turns[t].items()}
+
+
+def displacement_by_outcome_payload(results_dir, attacks=None):
+    """RQ1 headline, measured at the PAYLOAD'S ARRIVAL turn, not turn 0.
+
+    For each undefended attacked episode, the arrival turn t is the first step
+    whose prompt differs from its clean pair's (prompt_sha256) -- the same
+    localisation the attention replay uses. Up to t the two episodes are
+    identical, so clean[t] vs attacked[t] isolates the payload. Turn 0 would be
+    pre-injection (||dh||=0) for indirect injection, so turn-strategy loading is
+    wrong for this metric; this reads the specific turn instead.
+
+    Returns (summary attack->outcome->layer, exposure counts). An episode whose
+    prompts never differ was never exposed and is counted, not bucketed."""
+    # Reuse the attention replay's arrival-turn logic so the geometry and the
+    # attention metrics localise the payload identically: the first step whose
+    # prompt differs, ACCEPTED only when that difference is the payload (not
+    # turn 0, not the agent's own prior output, only a differing tool result).
+    from pathlib import Path as _Path
+    from experiments.attention_replay import read_transcript, first_differing_step, check_arrival
+
+    rows = load_rows(results_dir)
+    clean_by_task = {r["task_id"]: r for r in rows
+                     if r.get("condition") == "clean" and not r.get("error")
+                     and r.get("defense_name") in (None, "none")}
+    buckets = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    exposure = defaultdict(lambda: {"exposed": 0, "not_exposed": 0,
+                                    "not_payload_arrival": 0, "no_transcript": 0, "no_clean": 0})
+
+    for r in rows:
+        if r.get("condition") != "attacked" or r.get("error"):
+            continue
+        if r.get("defense_name") not in (None, "none"):
+            continue
+        attack = r.get("attack_name")
+        if attacks and attack not in attacks:
+            continue
+        clean = clean_by_task.get(r.get("task_id"))
+        if clean is None:
+            exposure[attack]["no_clean"] += 1
+            continue
+        ct = read_transcript(_Path(results_dir) / (clean["sample_id"] + ".transcript.json.gz"))
+        at = read_transcript(_Path(results_dir) / (r["sample_id"] + ".transcript.json.gz"))
+        if ct is None or at is None:
+            exposure[attack]["no_transcript"] += 1
+            continue
+        t = first_differing_step(ct, at)
+        if t is None:
+            exposure[attack]["not_exposed"] += 1
+            continue
+        if check_arrival(ct, at, t) is not None:   # divergence is not the payload arriving
+            exposure[attack]["not_payload_arrival"] += 1
+            continue
+        exposure[attack]["exposed"] += 1
+        adv_t = _load_turn(tensor_path(r), t)
+        cln_t = _load_turn(tensor_path(clean), t)
+        if adv_t is None or cln_t is None:
+            continue
+        s = None if r.get("scoring_error_final") else r.get("asr_success")
+        outcome = "success" if s is True else ("failure" if s is False else "unscored")
+        for layer, h_adv in adv_t.items():
+            h_cln = cln_t.get(layer)
+            if h_cln is None or h_cln.shape != h_adv.shape:
+                continue
+            d = h_adv - h_cln
+            nd = float(np.linalg.norm(d))
+            base = float(np.linalg.norm(h_cln))
+            buckets[attack][outcome][layer].append(
+                (nd, nd / base if base else float("nan"), cosine(h_adv, h_cln)))
+
+    summary = {}
+    for attack, outcomes in buckets.items():
+        summary[attack] = {}
+        for outcome, layers in outcomes.items():
+            summary[attack][outcome] = {}
+            for layer, vals in sorted(layers.items()):
+                arr = np.array(vals, dtype=np.float64)
+                summary[attack][outcome][layer] = {
+                    "n": int(arr.shape[0]),
+                    "delta_mean": float(np.nanmean(arr[:, 0])),
+                    "delta_median": float(np.nanmedian(arr[:, 0])),
+                    "delta_std": float(np.nanstd(arr[:, 0])),
+                    "delta_norm_mean": float(np.nanmean(arr[:, 1])),
+                    "cosine_mean": float(np.nanmean(arr[:, 2])),
+                }
+    return summary, {k: dict(v) for k, v in exposure.items()}
 
 
 def probe_separability(paired, seed=0):
@@ -387,7 +526,16 @@ def main():
         sys.exit("no episodes with a clean reference -- nothing to compare")
 
     geom = per_condition_geometry(paired)
+    by_outcome = per_condition_geometry_by_outcome(paired)
     probe = {} if args.skip_probe else probe_separability(paired)
+
+    # RQ1 headline at the payload's arrival turn (per directory, needs transcripts).
+    payload_outcome, payload_exposure = {}, {}
+    for d in args.results_dir:
+        s, e = displacement_by_outcome_payload(d)
+        if s or e:
+            payload_outcome[d] = s
+            payload_exposure[d] = e
 
     layers = sorted({L for c in paired.values() for L in c[CLEAN_NAME]["acts"]})
     pca_layer = args.pca_layer if args.pca_layer is not None else layers[-1]
@@ -398,6 +546,9 @@ def main():
         "n_episodes_paired": len(paired),
         "layers": layers,
         "geometry": geom,
+        "geometry_by_outcome": by_outcome,
+        "geometry_by_outcome_payload_turn": payload_outcome,
+        "payload_exposure": payload_exposure,
         "probe": probe,
         "pca": pca,
     }
@@ -419,6 +570,47 @@ def main():
                     ("%.4f" % pa["acc_mean"]) if pa else "",
                     ("%.4f" % pa["acc_std"]) if pa else ""))
 
+    # RQ1 headline: failed attacks still displace. Deepest layer, per attack.
+    oc_csv = os.path.join(args.out_dir, "geometry_by_outcome.csv")
+    with open(oc_csv, "w") as f:
+        f.write("attack,outcome,layer,n,delta_mean,delta_median,delta_norm_mean,cosine_mean\n")
+        for attack, outcomes in sorted(by_outcome.items()):
+            for outcome, layers_d in sorted(outcomes.items()):
+                for layer, m in sorted(layers_d.items()):
+                    f.write("%s,%s,%d,%d,%.6f,%.6f,%.6f,%.6f\n" % (
+                        attack, outcome, layer, m["n"], m["delta_mean"],
+                        m["delta_median"], m["delta_norm_mean"], m["cosine_mean"]))
+
+    # RQ1 headline CSV: displacement at the payload-arrival turn, by outcome.
+    pt_csv = os.path.join(args.out_dir, "displacement_payload_turn.csv")
+    with open(pt_csv, "w") as f:
+        f.write("results_dir,attack,outcome,layer,n,delta_mean,delta_median,delta_norm_mean,cosine_mean\n")
+        for d, summ in sorted(payload_outcome.items()):
+            for attack, outcomes in sorted(summ.items()):
+                for outcome, layers_d in sorted(outcomes.items()):
+                    for layer, m in sorted(layers_d.items()):
+                        f.write("%s,%s,%s,%d,%d,%.6f,%.6f,%.6f,%.6f\n" % (
+                            os.path.basename(d.rstrip("/")), attack, outcome, layer, m["n"],
+                            m["delta_mean"], m["delta_median"], m["delta_norm_mean"], m["cosine_mean"]))
+
+    print("\n=== RQ1: displacement at the payload-arrival turn (deepest layer) ===")
+    for d, summ in sorted(payload_outcome.items()):
+        exp = payload_exposure.get(d, {})
+        print("  [%s]" % os.path.basename(d.rstrip("/")))
+        for attack in sorted(summ):
+            deep = max((L for oc in summ[attack].values() for L in oc), default=None)
+            if deep is None:
+                continue
+            parts = []
+            for outcome in ("success", "failure", "unscored"):
+                m = summ[attack].get(outcome, {}).get(deep)
+                if m:
+                    parts.append("%s n=%d ||dh||=%.2f (med %.2f)" % (
+                        outcome, m["n"], m["delta_mean"], m["delta_median"]))
+            e = exp.get(attack, {})
+            print("    %-24s %s  [exposed %s, not %s]" % (
+                attack, " | ".join(parts), e.get("exposed", "?"), e.get("not_exposed", "?")))
+
     print("\n=== summary (turn_strategy=%s, %d paired episodes) ==="
           % (args.turn_strategy, len(paired)))
     for attack in sorted(geom):
@@ -432,7 +624,7 @@ def main():
             line += "  probe=%.3f+-%.3f (base %.2f)" % (
                 pa["acc_mean"], pa["acc_std"], pa["majority_baseline"])
         print(line)
-    print("\nwrote %s\n      %s" % (out, csv))
+    print("\nwrote %s\n      %s\n      %s\n      %s" % (out, csv, oc_csv, pt_csv))
 
 
 if __name__ == "__main__":

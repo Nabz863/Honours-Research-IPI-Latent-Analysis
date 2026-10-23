@@ -1,0 +1,401 @@
+"""
+analysis/stats.py -- hypothesis testing for the IPI geometry results.
+
+Motivation: 83.5% of AgentDojo episodes have an EXACTLY zero activation
+delta -- the injection sits in a tool result the agent never retrieved,
+so the attacked forward pass is byte-identical to the clean one. Any
+probe trained on the full population is trained on ~84% identical pairs
+and cannot exceed chance. Conditioning on delta > 0 is not cherry-picking:
+it is restricting to the episodes where the injected content actually
+entered the model's context, which is the population the hypothesis is
+about.
+
+Tests performed
+---------------
+1. Reachability rate per attack, with Wilson 95% CIs.
+2. Paired comparison of ||dh|| between attacks (same tasks, so paired).
+   Wilcoxon signed-rank -- deltas are heavily right-skewed (mean 34,
+   median 3.7), so a t-test's normality assumption is untenable.
+   Effect size: matched-pairs rank-biserial correlation.
+3. Linear probe (clean vs attacked) on the delta>0 subset, per layer,
+   GroupKFold by user task. Significance by PERMUTATION test on shuffled
+   labels rather than comparison to a nominal 0.5, because with grouped
+   folds and unbalanced classes the true null is not exactly 0.5.
+4. Holm-Bonferroni correction across layers within each attack.
+5. Fisher exact: does a non-zero delta predict behavioural ASR success?
+
+Usage
+-----
+    python3 analysis/stats.py --results_dir agentdojo_matrix_v4_qwen3vl \\
+        --layer 31 --n_perm 200 --out analysis_out/stats_qwen3vl_v4.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+
+import numpy as np
+
+try:
+    import torch
+except ImportError:
+    sys.exit("torch required")
+
+try:
+    from scipy import stats as sps
+except ImportError:
+    sps = None
+    print("[warn] scipy missing -- `venv/bin/pip install scipy`; "
+          "falling back to bootstrap-only where possible\n")
+
+ZERO_TOL = 1e-6
+
+
+# --------------------------------------------------------------------------
+# loading
+# --------------------------------------------------------------------------
+
+def load_pairs(results_dir, layer):
+    """{attack: [(task_id, group, h_clean, h_adv, asr), ...]}"""
+    rows = json.load(open(os.path.join(results_dir, "attack_results.json")))
+    by_task = defaultdict(dict)
+    for r in rows:
+        if r.get("defense_name") in (None, "none"):
+            by_task[r["task_id"]][r["attack_name"]] = r
+
+    def vec(sample_id):
+        p = os.path.join(results_dir, sample_id + ".pt")
+        if not os.path.exists(p):
+            return None
+        try:
+            turns = torch.load(p, map_location="cpu", weights_only=True)
+        except Exception:
+            return None
+        if not isinstance(turns, list) or not turns:
+            return None
+        vs = [t[layer].float().numpy() for t in turns if isinstance(t, dict) and layer in t]
+        return np.mean(vs, axis=0) if vs else None
+
+    out = defaultdict(list)
+    for task_id, conds in by_task.items():
+        if "clean" not in conds:
+            continue
+        hc = vec(conds["clean"]["sample_id"])
+        if hc is None:
+            continue
+        m = re.search(r"^(.*user_task_\d+)", task_id)
+        group = m.group(1) if m else task_id
+        for attack, r in conds.items():
+            if attack == "clean":
+                continue
+            ha = vec(r["sample_id"])
+            if ha is None:
+                continue
+            out[attack].append((task_id, group, hc, ha, r.get("asr_success")))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 1. reachability
+# --------------------------------------------------------------------------
+
+def wilson(k, n, z=1.96):
+    """Wilson score interval -- correct for proportions near 0 or 1,
+    unlike the normal approximation."""
+    if n == 0:
+        return (float("nan"), float("nan"))
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (max(0.0, c - h), min(1.0, c + h))
+
+
+def reachability(pairs):
+    res = {}
+    for attack, items in sorted(pairs.items()):
+        d = np.array([np.linalg.norm(ha - hc) for _, _, hc, ha, _ in items])
+        nz = int((d > ZERO_TOL).sum())
+        lo, hi = wilson(nz, len(d))
+        nzv = d[d > ZERO_TOL]
+        res[attack] = {
+            "n": len(d), "n_nonzero": nz, "rate": nz / len(d),
+            "rate_ci95": [lo, hi],
+            "delta_mean_all": float(d.mean()),
+            "delta_mean_nonzero": float(nzv.mean()) if nz else None,
+            "delta_median_nonzero": float(np.median(nzv)) if nz else None,
+            "delta_max": float(d.max()),
+        }
+    return res
+
+
+# --------------------------------------------------------------------------
+# 2. paired attack comparison
+# --------------------------------------------------------------------------
+
+def rank_biserial(x, y):
+    """Matched-pairs rank-biserial r: (n_pos - n_neg) / n_nonzero_diffs.
+    Bounded [-1, 1]; sign says which attack displaces more."""
+    d = np.asarray(x) - np.asarray(y)
+    d = d[d != 0]
+    if d.size == 0:
+        return 0.0
+    return float((np.sum(d > 0) - np.sum(d < 0)) / d.size)
+
+
+def compare_attacks(pairs, nonzero_only=True):
+    """Wilcoxon signed-rank on ||dh||, pairing by task_id."""
+    mags = {}
+    for attack, items in pairs.items():
+        mags[attack] = {t: float(np.linalg.norm(ha - hc))
+                        for t, _, hc, ha, _ in items}
+
+    names = sorted(mags)
+    out = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            shared = sorted(set(mags[a]) & set(mags[b]))
+            xa = np.array([mags[a][t] for t in shared])
+            xb = np.array([mags[b][t] for t in shared])
+            if nonzero_only:
+                keep = (xa > ZERO_TOL) | (xb > ZERO_TOL)
+                xa, xb = xa[keep], xb[keep]
+            entry = {"attack_a": a, "attack_b": b, "n_pairs": int(xa.size),
+                     "median_a": float(np.median(xa)) if xa.size else None,
+                     "median_b": float(np.median(xb)) if xb.size else None,
+                     "rank_biserial_r": rank_biserial(xa, xb)}
+            if sps is not None and xa.size >= 6 and np.any(xa - xb):
+                W, p = sps.wilcoxon(xa, xb, zero_method="wilcox",
+                                    alternative="two-sided")
+                entry["wilcoxon_W"] = float(W)
+                entry["p_raw"] = float(p)
+            out.append(entry)
+
+    if sps is not None and out:
+        holm(out, "p_raw", "p_holm")
+    return out
+
+
+def holm(entries, key_in, key_out):
+    """Holm-Bonferroni step-down. Controls family-wise error without
+    Bonferroni's conservatism."""
+    have = [e for e in entries if e.get(key_in) is not None]
+    m = len(have)
+    for rank, e in enumerate(sorted(have, key=lambda x: x[key_in])):
+        e[key_out] = float(min(1.0, e[key_in] * (m - rank)))
+    # enforce monotonicity
+    prev = 0.0
+    for e in sorted(have, key=lambda x: x[key_in]):
+        e[key_out] = max(e[key_out], prev)
+        prev = e[key_out]
+
+
+# --------------------------------------------------------------------------
+# 3. probe with permutation test
+# --------------------------------------------------------------------------
+
+def probe(pairs, layers_items, n_perm=200, seed=0):
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import GroupKFold
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import make_pipeline
+    except ImportError:
+        print("[warn] scikit-learn missing -- skipping probe")
+        return {}
+
+    def cv_acc(X, y, g, rng_labels=None):
+        yy = y if rng_labels is None else rng_labels
+        n_groups = len(set(g.tolist()))
+        if n_groups < 2 or len(set(yy.tolist())) < 2:
+            return None
+        gkf = GroupKFold(n_splits=min(3, n_groups))
+        accs = []
+        for tr, te in gkf.split(X, yy, groups=g):
+            if len(set(yy[tr].tolist())) < 2:
+                continue
+            clf = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(solver="liblinear", dual=True,
+                                   max_iter=200, random_state=seed))
+            clf.fit(X[tr], yy[tr])
+            accs.append(clf.score(X[te], yy[te]))
+        return float(np.mean(accs)) if accs else None
+
+    rng = np.random.default_rng(seed)
+    results = {}
+    for attack, items in sorted(layers_items.items()):
+        X, y, g = [], [], []
+        for _, group, hc, ha, _ in items:
+            if np.linalg.norm(ha - hc) <= ZERO_TOL:
+                continue                       # identical pair: no signal
+            X.append(hc); y.append(0); g.append(group)
+            X.append(ha); y.append(1); g.append(group)
+        X, y, g = np.array(X), np.array(y), np.array(g)
+        if X.shape[0] < 12:
+            results[attack] = {"n": int(X.shape[0]), "note": "too few non-zero pairs"}
+            continue
+
+        obs = cv_acc(X, y, g)
+        if obs is None:
+            results[attack] = {"n": int(X.shape[0]), "note": "cv failed"}
+            continue
+
+        # Permutation null: shuffle labels WITHIN group so the grouped-CV
+        # structure and class balance are preserved under H0.
+        null = []
+        for _ in range(n_perm):
+            yp = y.copy()
+            for grp in set(g.tolist()):
+                idx = np.where(g == grp)[0]
+                yp[idx] = rng.permutation(yp[idx])
+            a = cv_acc(X, y, g, rng_labels=yp)
+            if a is not None:
+                null.append(a)
+        null = np.array(null)
+        p = float((1 + np.sum(null >= obs)) / (1 + null.size)) if null.size else None
+
+        results[attack] = {
+            "n_samples": int(X.shape[0]),
+            "n_pairs": int(X.shape[0] // 2),
+            "accuracy": obs,
+            "null_mean": float(null.mean()) if null.size else None,
+            "null_p95": float(np.percentile(null, 95)) if null.size else None,
+            "p_perm": p,
+            "n_perm": int(null.size),
+        }
+    if results:
+        holm([v for v in results.values() if v.get("p_perm") is not None],
+             "p_perm", "p_holm")
+    return results
+
+
+# --------------------------------------------------------------------------
+# 5. does reachability predict ASR?
+# --------------------------------------------------------------------------
+
+def reach_vs_asr(pairs):
+    out = []
+    for attack, items in sorted(pairs.items()):
+        a = b = c = d = 0          # nonzero/ASR, nonzero/noASR, zero/ASR, zero/noASR
+        for _, _, hc, ha, asr in items:
+            nz = np.linalg.norm(ha - hc) > ZERO_TOL
+            hit = asr is True
+            if nz and hit: a += 1
+            elif nz: b += 1
+            elif hit: c += 1
+            else: d += 1
+        e = {"attack": attack, "table": [[a, b], [c, d]],
+             "asr_given_nonzero": a / (a + b) if a + b else None,
+             "asr_given_zero": c / (c + d) if c + d else None}
+        if sps is not None:
+            odds, p = sps.fisher_exact([[a, b], [c, d]])
+            e["odds_ratio"] = float(odds) if np.isfinite(odds) else None
+            e["p_raw"] = float(p)
+        out.append(e)
+    if sps is not None:
+        holm(out, "p_raw", "p_holm")
+    return out
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results_dir", required=True)
+    ap.add_argument("--layer", type=int, default=31)
+    ap.add_argument("--n_perm", type=int, default=200)
+    ap.add_argument("--out", default=None)
+    a = ap.parse_args()
+
+    pairs = load_pairs(a.results_dir, a.layer)
+    if not pairs:
+        sys.exit("no usable pairs -- check that --layer exists in the saved "
+                 "tensors for this model. Layer bands differ by architecture: "
+                 "18-31 for a 32-layer stack, 24-42 for Gemma's 48-layer one, "
+                 "so a layer valid for one model may be absent or mid-stack "
+                 "for another.")
+
+    # Since P2a every .pt holds ALL decoder layers, so the deepest captured
+    # layer is the final layer, not the analysis layer -- comparing against
+    # max(layer) would warn spuriously. The real silent error is a layer that
+    # is ABSENT (wrong model's band) or outside the band; a present analysis
+    # layer is fine. Report the band either way so the choice is auditable.
+    import glob as _glob
+    _pt = sorted(_glob.glob(os.path.join(a.results_dir, "clean_*.pt")))
+    if _pt:
+        try:
+            _t = torch.load(_pt[0], map_location="cpu", weights_only=True)
+            _avail = sorted(_t[0].keys()) if _t and isinstance(_t[0], dict) else []
+            if _avail and a.layer not in _avail:
+                print(f"[warn] --layer {a.layer} is NOT in the captured set "
+                      f"({min(_avail)}-{max(_avail)}); the number would be "
+                      f"measured at the wrong depth or fail to load.\n")
+            elif _avail:
+                print(f"[info] layer {a.layer} of captured band "
+                      f"{min(_avail)}-{max(_avail)}. Cross-model comparisons "
+                      f"should match RELATIVE depth (31/32 ~ 42/48).\n")
+        except Exception:
+            pass
+
+    reach = reachability(pairs)
+    cmp_ = compare_attacks(pairs)
+    prb = probe(pairs, pairs, n_perm=a.n_perm)
+    rva = reach_vs_asr(pairs)
+
+    print(f"\n=== {a.results_dir}  layer {a.layer} ===\n")
+
+    print("1. REACHABILITY (fraction of episodes with non-zero delta)")
+    for k, v in reach.items():
+        lo, hi = v["rate_ci95"]
+        print(f"   {k:24s} {v['n_nonzero']:4d}/{v['n']:<4d} = {100*v['rate']:5.1f}% "
+              f"[{100*lo:.1f}, {100*hi:.1f}]   ||dh|| nonzero: "
+              f"mean {v['delta_mean_nonzero']:.2f}  median {v['delta_median_nonzero']:.2f}")
+
+    print("\n2. PAIRED ||dh|| COMPARISON (Wilcoxon signed-rank, Holm-corrected)")
+    for e in cmp_:
+        p = e.get("p_holm")
+        sig = "" if p is None else ("  *" if p < 0.05 else "   ")
+        print(f"   {e['attack_a']:22s} vs {e['attack_b']:22s} n={e['n_pairs']:4d} "
+              f"med {e['median_a']:7.2f} vs {e['median_b']:7.2f}  "
+              f"r={e['rank_biserial_r']:+.3f}  "
+              f"p={'n/a' if p is None else f'{p:.3g}'}{sig}")
+
+    print("\n3. LINEAR PROBE on non-zero subset (permutation test, Holm-corrected)")
+    for k, v in prb.items():
+        if "accuracy" not in v:
+            print(f"   {k:24s} {v.get('note')}")
+            continue
+        p = v.get("p_holm", v.get("p_perm"))
+        sig = "  *" if (p is not None and p < 0.05) else "   "
+        print(f"   {k:24s} n={v['n_pairs']:4d} pairs  acc={v['accuracy']:.3f}  "
+              f"null={v['null_mean']:.3f} (p95 {v['null_p95']:.3f})  "
+              f"p={p:.3g}{sig}")
+
+    print("\n4. NON-ZERO DELTA vs ASR SUCCESS (Fisher exact, Holm-corrected)")
+    for e in rva:
+        p = e.get("p_holm")
+        az, zz = e["asr_given_nonzero"], e["asr_given_zero"]
+        f = lambda v: "  n/a" if v is None else f"{100*v:5.1f}%"
+        print(f"   {e['attack']:24s} ASR|reached={f(az)}  "
+              f"ASR|unreached={f(zz)}  "
+              f"OR={e.get('odds_ratio')}  p={'n/a' if p is None else f'{p:.3g}'}")
+
+    print("\n   * = significant at alpha=0.05 after Holm correction\n")
+
+    if a.out:
+        os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+        json.dump({"config": vars(a), "reachability": reach,
+                   "attack_comparison": cmp_, "probe": prb,
+                   "reach_vs_asr": rva}, open(a.out, "w"), indent=2)
+        print(f"wrote {a.out}")
+
+
+if __name__ == "__main__":
+    main()
