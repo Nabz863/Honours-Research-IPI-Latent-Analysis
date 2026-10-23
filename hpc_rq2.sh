@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=rq2
 #SBATCH --partition=stampede
-#SBATCH --nodes=1 --cpus-per-task=4 --mem=16G --time=02:00:00
+#SBATCH --nodes=1 --cpus-per-task=4 --mem=4G --time=02:00:00
 #SBATCH --output=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs/rq2_%j.out
 #SBATCH --error=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs/rq2_%j.err
 set -euo pipefail

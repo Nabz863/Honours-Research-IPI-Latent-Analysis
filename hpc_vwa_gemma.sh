@@ -91,6 +91,7 @@ echo "Cancel with: scancel $SLURM_JOB_ID   (or it holds until the 8h walltime ex
 R=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis
 cd "$R"
 export STRICT_ASR_CONFIG_DIR=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/strict_configs
+export CLEAN_UA_CONFIG_DIR=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/clean_configs
 source "$R/venv/bin/activate"
 source ~/vwa_adv_env.sh
 export AGENT_ATTACK_REPO=/datasets/nmahomed/vwa-adv/agent-attack

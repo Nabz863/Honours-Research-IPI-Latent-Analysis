@@ -63,6 +63,7 @@ from .gcg import GCGAttack
 
 class ObfuscatedActivationAttack(GCGAttack):
     name = "obfuscated_activation"
+    uses_task_context = True
     # Modality stays TEXTUAL (Table 3.2 lists this under Adaptive as a
     # category of evaluation, but the mechanism itself operates purely on
     # text tokens, same as GCGAttack) -- inherited from GCGAttack.
@@ -72,11 +73,12 @@ class ObfuscatedActivationAttack(GCGAttack):
         model,
         processor,
         extractor,
-        num_steps: int = 30,
+        num_steps: int = 50,
         suffix_length: int = 20,
-        topk: int = 64,
-        candidates_per_step: int = 32,
+        topk: int = 128,
+        candidates_per_step: int = 64,
         init_suffix_token: str = "x",
+        num_restarts: int = 3,
         geometry_weight: float = 1.0,
         target_layer: Optional[int] = None,
     ):
@@ -102,6 +104,7 @@ class ObfuscatedActivationAttack(GCGAttack):
             model, processor,
             num_steps=num_steps, suffix_length=suffix_length, topk=topk,
             candidates_per_step=candidates_per_step, init_suffix_token=init_suffix_token,
+            num_restarts=num_restarts,
         )
         if extractor.token_aggregation != "last":
             raise ValueError(
@@ -111,7 +114,21 @@ class ObfuscatedActivationAttack(GCGAttack):
             )
         self.extractor = extractor
         self.geometry_weight = geometry_weight
-        self.target_layer = target_layer if target_layer is not None else extractor.target_layers[0]
+        if target_layer is not None:
+            self.target_layer = target_layer
+        else:
+            # Default to the DEEPEST captured layer -- the one the analysis
+            # reads (audit 12.5c). The old default target_layers[0] optimised
+            # the geometry term at the shallowest captured layer, a different
+            # layer from the one RQ1/RQ4 report. Final runs should pass
+            # target_layer explicitly; this is only the fallback.
+            self.target_layer = extractor.target_layers[-1]
+            import warnings
+            warnings.warn(
+                "ObfuscatedActivationAttack: target_layer not given; defaulting to "
+                f"deepest captured layer {self.target_layer}. Pass it explicitly for "
+                "final runs so the geometry term matches the analysis layer."
+            )
         if self.target_layer not in extractor.target_layers:
             raise ValueError(
                 f"target_layer={self.target_layer} is not among the extractor's own "
@@ -124,6 +141,7 @@ class ObfuscatedActivationAttack(GCGAttack):
         target_behavior: str,
         clean_reference_activation: torch.Tensor,
         prompt: Optional[str] = None,
+        clean_transcript: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> AttackResult:
         """
@@ -133,7 +151,11 @@ class ObfuscatedActivationAttack(GCGAttack):
             should be a genuine Phase 1 baseline sample (e.g. loaded from
             baselines/<model>_clean/activations/sample_XXXX.pt), not a
             synthetic placeholder -- the entire point is mimicking REAL
-            clean-condition geometry, not an arbitrary target.
+            clean-condition geometry, not an arbitrary target. It MUST be
+            captured at self.target_layer and at the decision position -- a
+            reference from a different layer silently compares across layers
+            (audit 12.5b). The caller is responsible for this; the tensor
+            carries no layer tag to check.
         """
         tokenizer = self._tokenizer()
         embed_layer = self._embedding_matrix()
@@ -143,13 +165,12 @@ class ObfuscatedActivationAttack(GCGAttack):
 
         clean_reference_activation = clean_reference_activation.to(device=device, dtype=embed_weight.dtype)
 
-        prompt = prompt or base_input.get("prompt", "Follow the instructions in this content.")
-        injected_field = base_input.get("injectable_field", "page_text")
-        clean_text = base_input.get(injected_field, "")
-
-        prefix_text = f"{prompt}\n\n{clean_text}\n\n"
-        prefix_ids = torch.tensor(tokenizer.encode(prefix_text), device=device, dtype=torch.long)
-        target_ids = torch.tensor(tokenizer.encode(target_behavior), device=device, dtype=torch.long)
+        prefix_ids, tail_ids, clean_text, used_real_context = self._context_segments(
+            base_input, target_behavior, tokenizer, clean_transcript=clean_transcript
+        )
+        prefix_ids = prefix_ids.to(device=device, dtype=torch.long)
+        tail_ids = tail_ids.to(device=device, dtype=torch.long)
+        target_ids = torch.tensor(self._encode_without_specials(tokenizer, target_behavior), device=device, dtype=torch.long)
 
         seed_ids = tokenizer.encode(self.init_suffix_token)
         seed_id = seed_ids[-1] if seed_ids else 0
@@ -158,6 +179,7 @@ class ObfuscatedActivationAttack(GCGAttack):
         # untouched seed position -- validate it explicitly, same
         # rationale as gcg.py's docstring (real crash was exactly this).
         safe_mask = self._safe_token_mask(tokenizer, vocab_size, device)
+        self._active_tokenizer = tokenizer
         if not bool(safe_mask[seed_id]):
             fallback_id = int(torch.nonzero(safe_mask, as_tuple=False)[0].item())
             import warnings
@@ -168,42 +190,76 @@ class ObfuscatedActivationAttack(GCGAttack):
                 f"token id {fallback_id} as the seed instead."
             )
             seed_id = fallback_id
-
-        suffix_ids = torch.full((self.suffix_length,), seed_id, device=device, dtype=torch.long)
+        seed_id = self._stable_seed_id(tokenizer, safe_mask, seed_id)
 
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
 
-        combined_losses = ce_losses = geom_losses = None
-        best = 0
-        for _ in range(self.num_steps):
-            grad = self._combined_gradient(embed_layer, prefix_ids, suffix_ids, target_ids, clean_reference_activation)
-            # Same fix as gcg.py: restrict candidates to safe_chars-only
-            # tokens, inherited from GCGAttack. This class doesn't call
-            # super().generate() (needs its own combined-loss loop), so
-            # the mask has to be applied here explicitly too, not just in
-            # the parent class -- real GPU run crashed here for exactly
-            # this reason before the fix (see gcg.py's docstring).
-            # safe_mask computed once above, reused every step.
-            masked_neg_grad = (-grad).masked_fill(~safe_mask.unsqueeze(0), float("-inf"))
-            topk_ids = masked_neg_grad.topk(min(self.topk, vocab_size), dim=-1).indices
+        overall_suffix = None
+        overall_combined = float("inf")
+        overall_ce = None
+        overall_geom = None
+        overall_restart = -1
+        restart_losses = []
 
-            n_cand = self.candidates_per_step
-            candidates = suffix_ids.unsqueeze(0).repeat(n_cand, 1)
-            positions = torch.randint(0, self.suffix_length, (n_cand,), device=device)
-            choices = torch.randint(0, topk_ids.shape[1], (n_cand,), device=device)
-            for i in range(n_cand):
-                candidates[i, positions[i]] = topk_ids[positions[i], choices[i]]
+        for restart_idx in range(self.num_restarts):
+            suffix_ids = torch.full((self.suffix_length,), seed_id, device=device, dtype=torch.long)
+            best_suffix = suffix_ids.clone()
+            best_combined = float("inf")
+            best_ce = None
+            best_geom = None
 
-            combined_losses, ce_losses, geom_losses = self._evaluate_candidates_combined(
-                embed_layer, prefix_ids, candidates, target_ids, clean_reference_activation
-            )
-            best = int(combined_losses.argmin())
-            suffix_ids = candidates[best]
+            for _ in range(self.num_steps):
+                decision_position = len(prefix_ids) + len(suffix_ids) + len(tail_ids) - 1
+                grad = self._combined_gradient(
+                    embed_layer, prefix_ids, suffix_ids, target_ids, clean_reference_activation,
+                    tail_ids=tail_ids, decision_position=decision_position,
+                )
+                masked_neg_grad = (-grad).masked_fill(~safe_mask.unsqueeze(0), float("-inf"))
+                safe_count = int(safe_mask.sum().item())
+                if safe_count == 0:
+                    raise RuntimeError("No safe tokens remain for obfuscated-activation candidate selection")
+                topk_ids = masked_neg_grad.topk(min(self.topk, safe_count), dim=-1).indices
 
+                n_cand = self.candidates_per_step
+                candidates = suffix_ids.unsqueeze(0).repeat(n_cand, 1)
+                positions = torch.randint(0, self.suffix_length, (n_cand,), device=device)
+                choices = torch.randint(0, topk_ids.shape[1], (n_cand,), device=device)
+                for i in range(n_cand):
+                    candidates[i, positions[i]] = topk_ids[positions[i], choices[i]]
+                candidates[0] = suffix_ids
+
+                combined_losses, ce_losses, geom_losses = self._evaluate_candidates_combined(
+                    embed_layer, prefix_ids, candidates, target_ids, clean_reference_activation,
+                    tail_ids=tail_ids, decision_position=decision_position,
+                )
+                valid_candidates = self._roundtrip_candidate_mask(candidates)
+                if valid_candidates is not None:
+                    combined_losses = combined_losses.masked_fill(~valid_candidates, float("inf"))
+                best = int(combined_losses.argmin())
+                step_combined = float(combined_losses[best])
+                suffix_ids = candidates[best].clone()
+                if step_combined < best_combined:
+                    best_combined = step_combined
+                    best_suffix = suffix_ids.clone()
+                    best_ce = float(ce_losses[best])
+                    best_geom = float(geom_losses[best])
+
+            restart_losses.append(best_combined)
+            if best_combined < overall_combined:
+                overall_combined = best_combined
+                overall_suffix = best_suffix.clone()
+                overall_ce = best_ce
+                overall_geom = best_geom
+                overall_restart = restart_idx
+
+        suffix_ids = overall_suffix
         adv_suffix_text = tokenizer.decode(suffix_ids.tolist())
-        adversarial_text = f"{clean_text} {adv_suffix_text}"
+        roundtrip_verified = self._roundtrip_safe_ids(tokenizer, suffix_ids.tolist())
+        if not roundtrip_verified:
+            raise RuntimeError("Selected obfuscated-activation suffix does not survive decode→encode round trip")
+        adversarial_text = f"{target_behavior} {adv_suffix_text}"
 
         return AttackResult(
             attack_name=self.name,
@@ -214,15 +270,22 @@ class ObfuscatedActivationAttack(GCGAttack):
                 "num_steps": self.num_steps,
                 "suffix_length": self.suffix_length,
                 "topk": self.topk,
+                "candidates_per_step": self.candidates_per_step,
+                "num_restarts": self.num_restarts,
+                "best_restart_idx": overall_restart,
+                "restart_losses": restart_losses,
                 "geometry_weight": self.geometry_weight,
                 "target_layer": self.target_layer,
-                "final_combined_loss": float(combined_losses[best]) if combined_losses is not None else None,
-                "final_behavioral_ce_loss": float(ce_losses[best]) if ce_losses is not None else None,
-                "final_geometry_distance": float(geom_losses[best]) if geom_losses is not None else None,
+                "used_real_templated_context": used_real_context,
+                "target_has_special_tokens": False,
+                "suffix_roundtrip_verified": roundtrip_verified,
+                "final_combined_loss": overall_combined if overall_ce is not None else None,
+                "final_behavioral_ce_loss": overall_ce,
+                "final_geometry_distance": overall_geom,
             },
         )
 
-    def _local_activation_capture(self):
+    def _local_activation_capture(self, position: int):
         """
         Registers a NON-detaching forward hook on the model's own layer
         module at self.target_layer -- same layer-list resolution
@@ -240,14 +303,15 @@ class ObfuscatedActivationAttack(GCGAttack):
 
         def hook(module, inp, output):
             hidden = output[0] if isinstance(output, tuple) else output
-            holder["activation"] = hidden[0, -1]  # last token, batch 0 -- same convention as
+            holder["activation"] = hidden[0, position]  # decision-position token, batch 0 -- same convention as
             # ActivationExtractor's 'last' aggregation mode, but deliberately NOT detached.
 
         handle = layer.register_forward_hook(hook)
         return handle, holder
 
     def _combined_gradient(
-        self, embed_layer, prefix_ids, suffix_ids, target_ids, clean_reference_activation
+        self, embed_layer, prefix_ids, suffix_ids, target_ids, clean_reference_activation,
+        tail_ids=None, decision_position: Optional[int] = None,
     ) -> torch.Tensor:
         embed_weight = embed_layer.weight
         vocab_size = embed_weight.shape[0]
@@ -255,18 +319,23 @@ class ObfuscatedActivationAttack(GCGAttack):
         one_hot = torch.zeros(len(suffix_ids), vocab_size, device=suffix_ids.device, dtype=embed_weight.dtype)
         one_hot.scatter_(1, suffix_ids.unsqueeze(1), 1.0)
         one_hot.requires_grad_(True)
-        suffix_embeds = one_hot @ embed_weight
+        embed_scale = getattr(embed_layer, "embed_scale", 1.0)  # B5: see gcg.py
+        suffix_embeds = (one_hot @ embed_weight) * embed_scale
 
         prefix_embeds = embed_layer(prefix_ids)
         target_embeds = embed_layer(target_ids)
-        inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, target_embeds], dim=0).unsqueeze(0)
+        tail_ids = tail_ids if tail_ids is not None else prefix_ids.new_empty((0,))
+        tail_embeds = embed_layer(tail_ids)
+        inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, tail_embeds, target_embeds], dim=0).unsqueeze(0)
 
         labels = torch.cat([
-            torch.full((len(prefix_ids) + len(suffix_ids),), -100, device=suffix_ids.device, dtype=torch.long),
+            torch.full((len(prefix_ids) + len(suffix_ids) + len(tail_ids),), -100, device=suffix_ids.device, dtype=torch.long),
             target_ids,
         ]).unsqueeze(0)
 
-        handle, holder = self._local_activation_capture()
+        if decision_position is None:
+            decision_position = len(prefix_ids) + len(suffix_ids) + len(tail_ids) - 1
+        handle, holder = self._local_activation_capture(decision_position)
         try:
             outputs = self.model(inputs_embeds=inputs_embeds, labels=labels)
         finally:
@@ -291,7 +360,8 @@ class ObfuscatedActivationAttack(GCGAttack):
         return grad
 
     def _evaluate_candidates_combined(
-        self, embed_layer, prefix_ids, candidates, target_ids, clean_reference_activation
+        self, embed_layer, prefix_ids, candidates, target_ids, clean_reference_activation,
+        tail_ids=None, decision_position: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Real GPU run (job 23421) measured this method making
@@ -321,8 +391,13 @@ class ObfuscatedActivationAttack(GCGAttack):
 
         prefix_embeds = embed_layer(prefix_ids)
         target_embeds = embed_layer(target_ids)
+        tail_ids = tail_ids if tail_ids is not None else prefix_ids.new_empty((0,))
+        tail_embeds = embed_layer(tail_ids)
         prefix_len = len(prefix_ids)
         suffix_len = candidates.shape[1]
+        tail_len = len(tail_ids)
+        if decision_position is None:
+            decision_position = prefix_len + suffix_len + tail_len - 1
 
         layer_list = _get_layer_list(self.model)
         layer = layer_list[self.target_layer]
@@ -330,16 +405,16 @@ class ObfuscatedActivationAttack(GCGAttack):
 
         def hook(module, inp, output):
             hidden = output[0] if isinstance(output, tuple) else output
-            holder["activation"] = hidden[0, -1].detach()
+            holder["activation"] = hidden[0, decision_position].detach()
 
         handle = layer.register_forward_hook(hook)
         try:
             with torch.no_grad():
                 for i in range(n):
                     suffix_embeds = embed_layer(candidates[i])
-                    inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, target_embeds], dim=0).unsqueeze(0)
+                    inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, tail_embeds, target_embeds], dim=0).unsqueeze(0)
                     labels = torch.cat([
-                        torch.full((prefix_len + suffix_len,), -100, device=device, dtype=torch.long),
+                        torch.full((prefix_len + suffix_len + tail_len,), -100, device=device, dtype=torch.long),
                         target_ids,
                     ]).unsqueeze(0)
 

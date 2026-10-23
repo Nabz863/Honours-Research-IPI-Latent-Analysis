@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=coverage
 #SBATCH --partition=stampede
-#SBATCH --nodes=1 --cpus-per-task=4 --mem=16G --time=04:00:00
+#SBATCH --nodes=1 --cpus-per-task=4 --mem=4G --time=04:00:00
 #SBATCH --output=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs/coverage_%j.out
 #SBATCH --error=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/logs/coverage_%j.err
 set -uo pipefail

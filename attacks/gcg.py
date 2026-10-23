@@ -81,6 +81,7 @@ from .base import AttackModality, AttackResult, BaseAttack
 class GCGAttack(BaseAttack):
     name = "gcg"
     modality = AttackModality.TEXTUAL
+    uses_task_context = True
 
     def __init__(
         self,
@@ -171,7 +172,15 @@ class GCGAttack(BaseAttack):
             except Exception:
                 continue
             if text and all(c in self.safe_chars for c in text):
-                mask[token_id] = True
+                try:
+                    roundtrip = tokenizer.encode(text, add_special_tokens=False)
+                except TypeError:
+                    # Test/fallback tokenizers may not implement HF's kwarg;
+                    # they cannot provide a meaningful round-trip guarantee.
+                    mask[token_id] = True
+                else:
+                    if list(roundtrip) == [token_id]:
+                        mask[token_id] = True
 
         if not mask.any():
             raise RuntimeError(
@@ -195,11 +204,132 @@ class GCGAttack(BaseAttack):
         """
         return self.model.get_input_embeddings()
 
+    @staticmethod
+    def _encode_without_specials(tokenizer, text: str) -> List[int]:
+        try:
+            return list(tokenizer.encode(text, add_special_tokens=False))
+        except TypeError:
+            # Small fake tokenizers used by unit tests may not accept the kwarg.
+            return list(tokenizer.encode(text))
+
+    @staticmethod
+    def _replace_first_text(value, needle: str, replacement: str):
+        """Recursively replace the first occurrence in transcript message content."""
+        if isinstance(value, str):
+            if needle and needle in value:
+                return value.replace(needle, replacement, 1), True
+            return value, False
+        if isinstance(value, list):
+            out = []
+            found = False
+            for item in value:
+                if found:
+                    out.append(item)
+                else:
+                    item, found = GCGAttack._replace_first_text(item, needle, replacement)
+                    out.append(item)
+            return out, found
+        if isinstance(value, dict):
+            out = {}
+            found = False
+            for key, item in value.items():
+                if found:
+                    out[key] = item
+                else:
+                    item, found = GCGAttack._replace_first_text(item, needle, replacement)
+                    out[key] = item
+            return out, found
+        return value, False
+
+    def _supports_roundtrip_check(self, tokenizer) -> bool:
+        try:
+            tokenizer.encode("", add_special_tokens=False)
+            return True
+        except TypeError:
+            return False
+
+    def _roundtrip_safe_ids(self, tokenizer, token_ids) -> bool:
+        if not self._supports_roundtrip_check(tokenizer):
+            return True  # a non-HF test tokenizer cannot express this contract
+        text = tokenizer.decode(list(token_ids))
+        return self._encode_without_specials(tokenizer, text) == list(token_ids)
+
+    def _stable_seed_id(self, tokenizer, safe_mask, preferred_id: int) -> int:
+        """Find a safe token whose repeated decoded suffix preserves token IDs."""
+        if not self._supports_roundtrip_check(tokenizer):
+            return preferred_id
+        candidates = [preferred_id] + [int(x) for x in torch.nonzero(safe_mask, as_tuple=False).flatten().tolist()
+                                       if int(x) != preferred_id]
+        for token_id in candidates[:512]:
+            if self._roundtrip_safe_ids(tokenizer, [token_id] * self.suffix_length):
+                return token_id
+        raise RuntimeError(
+            "Could not find a round-trip-stable repeated seed among the first 512 safe tokens; "
+            "refusing to optimize token IDs that will change when the payload is decoded and delivered."
+        )
+
+    def _roundtrip_candidate_mask(self, candidates) -> Optional[torch.Tensor]:
+        tokenizer = getattr(self, "_active_tokenizer", None)
+        if tokenizer is None or not self._supports_roundtrip_check(tokenizer):
+            return None
+        valid = [self._roundtrip_safe_ids(tokenizer, row) for row in candidates.detach().cpu().tolist()]
+        return torch.tensor(valid, dtype=torch.bool, device=candidates.device)
+
+    def _context_segments(self, base_input, target_behavior, tokenizer, clean_transcript=None):
+        """Return token ids on either side of the optimized suffix insertion point.
+
+        For AgentDojo, replay the actual clean episode's latest transcript turn
+        with the malicious instruction inserted where the injectable vector was
+        observed, then use the victim processor's chat template. The suffix is
+        optimized at that exact insertion point. For callers without a transcript
+        (e.g. legacy text-only VWA invocations), use the supplied page text as the
+        available context rather than inventing a system prompt or tool schema.
+        """
+        field = base_input.get("injectable_field", "page_text")
+        clean_text = str(base_input.get(field, "") or "")
+        marker = "ZXQGCSUFFIXMARKER7F3A"
+        if clean_transcript and clean_text:
+            messages_table = clean_transcript.get("messages", [])
+            steps = clean_transcript.get("steps", [])
+            # Prefer the latest transcript step containing this exact injection vector.
+            for step in reversed(steps):
+                ids = step.get("input") or step.get("raw_input") or []
+                try:
+                    conversation = [messages_table[int(i)] for i in ids]
+                except (IndexError, TypeError, ValueError):
+                    continue
+                replaced, found = self._replace_first_text(
+                    conversation, clean_text, f"{target_behavior} {marker}"
+                )
+                if not found:
+                    continue
+                rendered = self.processor.apply_chat_template(
+                    replaced, add_generation_prompt=True, tokenize=False
+                )
+                if marker not in rendered:
+                    continue
+                left, right = rendered.split(marker, 1)
+                return (torch.tensor(self._encode_without_specials(tokenizer, left), dtype=torch.long),
+                        torch.tensor(self._encode_without_specials(tokenizer, right), dtype=torch.long),
+                        clean_text, True)
+            raise RuntimeError(
+                "clean_transcript was supplied, but its recorded messages do not contain "
+                "the injectable vector text; refusing to optimize GCG in a fabricated context."
+            )
+
+        # Fallback for callers that do not provide a clean AgentDojo transcript.
+        left = f"{clean_text}\n\n{target_behavior} "
+        right = "\n\n"
+        return (torch.tensor(self._encode_without_specials(tokenizer, left), dtype=torch.long),
+                torch.tensor(self._encode_without_specials(tokenizer, right), dtype=torch.long),
+                clean_text, False)
+
     def generate(
         self,
         base_input: Dict[str, Any],
         target_behavior: str,
         prompt: Optional[str] = None,
+        clean_transcript: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> AttackResult:
         """
@@ -222,13 +352,12 @@ class GCGAttack(BaseAttack):
         device = embed_weight.device
         vocab_size = embed_weight.shape[0]
 
-        prompt = prompt or base_input.get("prompt", "Follow the instructions in this content.")
-        injected_field = base_input.get("injectable_field", "page_text")
-        clean_text = base_input.get(injected_field, "")
-
-        prefix_text = f"{prompt}\n\n{clean_text}\n\n"
-        prefix_ids = torch.tensor(tokenizer.encode(prefix_text), device=device, dtype=torch.long)
-        target_ids = torch.tensor(tokenizer.encode(target_behavior), device=device, dtype=torch.long)
+        prefix_ids, tail_ids, clean_text, used_real_context = self._context_segments(
+            base_input, target_behavior, tokenizer, clean_transcript=clean_transcript
+        )
+        prefix_ids = prefix_ids.to(device=device, dtype=torch.long)
+        tail_ids = tail_ids.to(device=device, dtype=torch.long)
+        target_ids = torch.tensor(self._encode_without_specials(tokenizer, target_behavior), device=device, dtype=torch.long)
 
         suffix_token_ids = tokenizer.encode(self.init_suffix_token)
         # Some tokenizers prepend a special token (e.g. BOS) even for a
@@ -246,6 +375,7 @@ class GCGAttack(BaseAttack):
         # explicitly rather than assume. Validated ONCE here, shared by
         # every restart (all restarts share the same seed_id).
         safe_mask = self._safe_token_mask(tokenizer, vocab_size, device)
+        self._active_tokenizer = tokenizer
         if not bool(safe_mask[seed_id]):
             fallback_id = int(torch.nonzero(safe_mask, as_tuple=False)[0].item())
             import warnings
@@ -257,6 +387,7 @@ class GCGAttack(BaseAttack):
                 "if this fallback is inappropriate for this model/tokenizer."
             )
             seed_id = fallback_id
+        seed_id = self._stable_seed_id(tokenizer, safe_mask, seed_id)
 
         self.model.eval()
         for p in self.model.parameters():
@@ -269,7 +400,7 @@ class GCGAttack(BaseAttack):
 
         for restart_idx in range(self.num_restarts):
             suffix_ids, final_loss = self._run_single_restart(
-                embed_layer, prefix_ids, target_ids, safe_mask, seed_id, device
+                embed_layer, prefix_ids, tail_ids, target_ids, safe_mask, seed_id, device
             )
             restart_losses.append(final_loss)
             if final_loss < best_loss:
@@ -278,7 +409,10 @@ class GCGAttack(BaseAttack):
                 best_restart_idx = restart_idx
 
         adv_suffix_text = tokenizer.decode(best_suffix_ids.tolist())
-        adversarial_text = f"{clean_text} {adv_suffix_text}"
+        roundtrip_verified = self._roundtrip_safe_ids(tokenizer, best_suffix_ids.tolist())
+        if not roundtrip_verified:
+            raise RuntimeError("Selected GCG suffix does not survive decode→encode round trip")
+        adversarial_text = f"{target_behavior} {adv_suffix_text}"
 
         return AttackResult(
             attack_name=self.name,
@@ -294,6 +428,9 @@ class GCGAttack(BaseAttack):
                 "best_restart_idx": best_restart_idx,
                 "final_loss": best_loss,
                 "restart_losses": restart_losses,
+                "used_real_templated_context": used_real_context,
+                "target_has_special_tokens": False,
+                "suffix_roundtrip_verified": roundtrip_verified,
             },
         )
 
@@ -301,6 +438,7 @@ class GCGAttack(BaseAttack):
         self,
         embed_layer,
         prefix_ids: torch.Tensor,
+        tail_ids: torch.Tensor,
         target_ids: torch.Tensor,
         safe_mask: torch.Tensor,
         seed_id: int,
@@ -318,8 +456,12 @@ class GCGAttack(BaseAttack):
 
         losses = None
         best = 0
+        best_suffix = suffix_ids.clone()
+        best_loss = float(self._evaluate_candidates(
+            embed_layer, prefix_ids, suffix_ids.unsqueeze(0), target_ids, tail_ids=tail_ids
+        )[0])
         for _ in range(self.num_steps):
-            grad = self._suffix_gradient(embed_layer, prefix_ids, suffix_ids, target_ids)
+            grad = self._suffix_gradient(embed_layer, prefix_ids, suffix_ids, target_ids, tail_ids=tail_ids)
 
             # Steepest-descent candidates: topk tokens whose one-hot
             # direction MOST DECREASES loss at each position (smallest/
@@ -328,7 +470,10 @@ class GCGAttack(BaseAttack):
             # tokens get -inf so they can never win topk, regardless of
             # how promising their raw gradient looked.
             masked_neg_grad = (-grad).masked_fill(~safe_mask.unsqueeze(0), float("-inf"))
-            topk_ids = masked_neg_grad.topk(min(self.topk, vocab_size), dim=-1).indices  # [suffix_length, topk]
+            safe_count = int(safe_mask.sum().item())
+            if safe_count == 0:
+                raise RuntimeError("No safe tokens remain for GCG candidate selection")
+            topk_ids = masked_neg_grad.topk(min(self.topk, safe_count), dim=-1).indices  # [suffix_length, <= topk]
 
             n_cand = self.candidates_per_step
             candidates = suffix_ids.unsqueeze(0).repeat(n_cand, 1)
@@ -336,15 +481,22 @@ class GCGAttack(BaseAttack):
             choices = torch.randint(0, topk_ids.shape[1], (n_cand,), device=device)
             for i in range(n_cand):
                 candidates[i, positions[i]] = topk_ids[positions[i], choices[i]]
+            candidates[0] = suffix_ids
 
-            losses = self._evaluate_candidates(embed_layer, prefix_ids, candidates, target_ids)
+            losses = self._evaluate_candidates(embed_layer, prefix_ids, candidates, target_ids, tail_ids=tail_ids)
+            valid_candidates = self._roundtrip_candidate_mask(candidates)
+            if valid_candidates is not None:
+                losses = losses.masked_fill(~valid_candidates, float("inf"))
             best = int(losses.argmin())
-            suffix_ids = candidates[best]
+            step_loss = float(losses[best])
+            suffix_ids = candidates[best].clone()
+            if step_loss < best_loss:
+                best_loss = step_loss
+                best_suffix = suffix_ids.clone()
 
-        final_loss = float(losses[best]) if losses is not None else float("inf")
-        return suffix_ids, final_loss
+        return best_suffix, best_loss
 
-    def _suffix_gradient(self, embed_layer, prefix_ids, suffix_ids, target_ids) -> torch.Tensor:
+    def _suffix_gradient(self, embed_layer, prefix_ids, suffix_ids, target_ids, tail_ids=None) -> torch.Tensor:
         """
         Returns d(loss)/d(one_hot(suffix)) -- shape [suffix_length, vocab_size].
 
@@ -361,14 +513,24 @@ class GCGAttack(BaseAttack):
         one_hot = torch.zeros(len(suffix_ids), vocab_size, device=suffix_ids.device, dtype=embed_weight.dtype)
         one_hot.scatter_(1, suffix_ids.unsqueeze(1), 1.0)
         one_hot.requires_grad_(True)
-        suffix_embeds = one_hot @ embed_weight  # [suffix_length, hidden_dim] -- differentiable wrt one_hot
+        # B5: Gemma 3's word-embedding module scales its forward output by
+        # embed_scale (= hidden_size**0.5). embed_layer(prefix_ids) below goes
+        # through that forward and IS scaled; one_hot @ weight hits the raw
+        # weight and is NOT, leaving the suffix sqrt(hidden) smaller than the
+        # tokens beside it and shrinking its gradient by the same factor.
+        # _evaluate_candidates uses embed_layer(...), so it is already correct;
+        # match it here. embed_scale is 1.0 (a no-op) on models without one.
+        embed_scale = getattr(embed_layer, "embed_scale", 1.0)
+        suffix_embeds = (one_hot @ embed_weight) * embed_scale  # [suffix_length, hidden_dim]
 
         prefix_embeds = embed_layer(prefix_ids)
         target_embeds = embed_layer(target_ids)
-        inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, target_embeds], dim=0).unsqueeze(0)
+        tail_ids = tail_ids if tail_ids is not None else prefix_ids.new_empty((0,))
+        tail_embeds = embed_layer(tail_ids)
+        inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, tail_embeds, target_embeds], dim=0).unsqueeze(0)
 
         labels = torch.cat([
-            torch.full((len(prefix_ids) + len(suffix_ids),), -100, device=suffix_ids.device, dtype=torch.long),
+            torch.full((len(prefix_ids) + len(suffix_ids) + len(tail_ids),), -100, device=suffix_ids.device, dtype=torch.long),
             target_ids,
         ]).unsqueeze(0)
 
@@ -379,7 +541,7 @@ class GCGAttack(BaseAttack):
         one_hot.grad = None
         return grad
 
-    def _evaluate_candidates(self, embed_layer, prefix_ids, candidates, target_ids) -> torch.Tensor:
+    def _evaluate_candidates(self, embed_layer, prefix_ids, candidates, target_ids, tail_ids=None) -> torch.Tensor:
         """
         Real (non-approximated) loss for each candidate suffix -- this is
         what actually decides which single-token substitution gets kept.
@@ -391,15 +553,18 @@ class GCGAttack(BaseAttack):
         losses = torch.empty(candidates.shape[0], device=device)
         prefix_embeds = embed_layer(prefix_ids)
         target_embeds = embed_layer(target_ids)
+        tail_ids = tail_ids if tail_ids is not None else prefix_ids.new_empty((0,))
+        tail_embeds = embed_layer(tail_ids)
         prefix_len = len(prefix_ids)
         suffix_len = candidates.shape[1]
+        tail_len = len(tail_ids)
 
         with torch.no_grad():
             for i in range(candidates.shape[0]):
                 suffix_embeds = embed_layer(candidates[i])
-                inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, target_embeds], dim=0).unsqueeze(0)
+                inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, tail_embeds, target_embeds], dim=0).unsqueeze(0)
                 labels = torch.cat([
-                    torch.full((prefix_len + suffix_len,), -100, device=device, dtype=torch.long),
+                    torch.full((prefix_len + suffix_len + tail_len,), -100, device=device, dtype=torch.long),
                     target_ids,
                 ]).unsqueeze(0)
                 outputs = self.model(inputs_embeds=inputs_embeds, labels=labels)

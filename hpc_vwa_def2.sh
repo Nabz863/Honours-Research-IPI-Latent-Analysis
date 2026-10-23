@@ -91,6 +91,7 @@ echo "Cancel with: scancel $SLURM_JOB_ID   (or it holds until the 8h walltime ex
 R=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis
 cd "$R"
 export STRICT_ASR_CONFIG_DIR=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/strict_configs
+export CLEAN_UA_CONFIG_DIR=/home-mscluster/nmahomed/Honours-Research-IPI-Latent-Analysis/clean_configs
 source "$R/venv/bin/activate"
 source ~/vwa_adv_env.sh
 export AGENT_ATTACK_REPO=/datasets/nmahomed/vwa-adv/agent-attack
@@ -100,7 +101,7 @@ echo "=== starting curated matrix at $(date) ==="
 python experiments/run_vwa_adv_curated_matrix.py \
     --model_id Qwen/Qwen3-VL-8B-Instruct \
     --attack_names typographic steganographic pixel_perturbation adversarial_patch \
-    --defense_names gaussian_blur_1.5 gaussian_blur_3.0 ecso \
+    --defense_names gaussian_blur_1.5 gaussian_blur_3.0 \
     --site reddit --max_steps 15 \
-    --output_dir "$R/vwa_adv_qwen3vl_def2"
+    --output_dir "$R/vwa_adv_qwen3vl_def3"
 echo "=== matrix finished at $(date) ==="
