@@ -326,26 +326,37 @@ def _load_turn(path, t):
 # ----------------------------------------------------------------------------
 
 _SPOTLIGHT_KEY = re.compile(r"SPOTLIGHT-[0-9a-f]{16}")
+# A timestamp the environment writes at RUN time (datetime.now(), microsecond
+# precision), e.g. AgentDojo workspace's `last_modified` on a file the agent
+# creates. Fixture data carries no microseconds, so only run-time stamps match.
+_RUNTIME_TS = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.\d{6}")
 
 
-def _mask_spotlight(tr):
-    """Copy of a transcript with spotlighting_delimiting's delimiter masked.
-    That defence names a delimiter derived from the tool output's content
-    (SPOTLIGHT-<16 hex>) in the tool result AND in the system message, so when
-    the payload arrives the system message changes too (diag_arrival, 10-29:
-    every delimiting pair was rejected for a differing system message whose
-    only difference is that key). Masking it lets check_arrival see that the
-    payload is the only real difference; any other change still rejects."""
+def _mask_text(x):
+    return _RUNTIME_TS.sub("<ts>", _SPOTLIGHT_KEY.sub("SPOTLIGHT-#", x))
+
+
+def _mask_volatile(tr):
+    """Copy of a transcript with the two run-dependent strings masked:
+    - spotlighting_delimiting's delimiter key (SPOTLIGHT-<16 hex>), derived from
+      the tool output's content and named in the tool result AND the system
+      message, so the system message changes when the payload arrives
+      (diag_arrival, 10-29: every delimiting pair was rejected for it);
+    - run-time timestamps (_RUNTIME_TS): two episodes run hours apart differ in
+      them although nothing the attacker wrote is involved (diag_exposure,
+      10-29: 24 Qwen3-VL workspace_user_task_31 pairs per attack were 'reached'
+      only through a file's last_modified time, with no payload in the prompt).
+    Everything else is compared as recorded."""
     def blk(b):
         if isinstance(b, dict) and isinstance(b.get("text"), str):
-            return dict(b, text=_SPOTLIGHT_KEY.sub("SPOTLIGHT-#", b["text"]))
+            return dict(b, text=_mask_text(b["text"]))
         return b
     def msg(m):
         if not isinstance(m, dict):
             return m
         c = m.get("content")
         if isinstance(c, str):
-            return dict(m, content=_SPOTLIGHT_KEY.sub("SPOTLIGHT-#", c))
+            return dict(m, content=_mask_text(c))
         if isinstance(c, list):
             return dict(m, content=[blk(b) for b in c])
         return m
@@ -355,15 +366,19 @@ def _mask_spotlight(tr):
 def arrival_step(results_dir, sid_ref, sid_cmp, accept_step0=False):
     """(t, status) for two episodes of one task that differ only by the payload
     (clean vs attacked, or defended-clean vs defended-attacked under the same
-    defence). t = the first step whose prompt differs (prompt_sha256), accepted
-    as the payload's arrival by attention_replay.check_arrival: the episodes
-    did the same at t-1 and every differing message is a tool result.
+    defence). t = the first step whose prompt differs in more than run-time
+    noise (prompt_sha256 differs AND the conversations still differ with
+    _mask_volatile applied), accepted as the payload's arrival by
+    attention_replay.check_arrival on the masked transcripts: the episodes did
+    the same at t-1 and every differing message is a tool result.
     accept_step0: a benchmark whose payload is in the FIRST observation (VWA:
     the page) differs at step 0 by construction; accept t = 0 there.
-    status: ok | not_exposed (prompts identical throughout) | no_transcript |
+    status: ok | not_exposed (prompts identical throughout) | volatile_only
+    (prompts differ only by run-time timestamps / keys) | no_transcript |
     not_payload_arrival | length_differs_no_diff."""
     from pathlib import Path as _Path
-    from experiments.attention_replay import read_transcript, first_differing_step, check_arrival
+    from experiments.attention_replay import (read_transcript, first_differing_step,
+                                              check_arrival, step_conversation)
     d = _Path(results_dir)
     tr = read_transcript(d / (sid_ref + ".transcript.json.gz"))
     tc = read_transcript(d / (sid_cmp + ".transcript.json.gz"))
@@ -373,10 +388,20 @@ def arrival_step(results_dir, sid_ref, sid_cmp, accept_step0=False):
     if t is None:
         same = len(tr.get("steps", [])) == len(tc.get("steps", []))
         return None, ("not_exposed" if same else "length_differs_no_diff")
+    mr, mc = _mask_volatile(tr), _mask_volatile(tc)
+    n = min(len(tr["steps"]), len(tc["steps"]))
+    while t is not None and step_conversation(mr, t) == step_conversation(mc, t):
+        t = next((k for k in range(t + 1, n)
+                  if tr["steps"][k].get("prompt_sha256") != tc["steps"][k].get("prompt_sha256")), None)
+    if t is None:
+        # nothing but run-time noise differs on the shared steps; if the episodes
+        # still end at different steps, they diverged after it -- the same
+        # anomaly as identical prompts with different lengths, not "unexposed"
+        same = len(tr["steps"]) == len(tc["steps"])
+        return None, ("volatile_only" if same else "length_differs_no_diff")
     if t == 0 and accept_step0:
         return 0, "ok"
-    if (check_arrival(tr, tc, t) is not None
-            and check_arrival(_mask_spotlight(tr), _mask_spotlight(tc), t) is not None):
+    if check_arrival(mr, mc, t) is not None:
         return None, "not_payload_arrival"
     return t, "ok"
 
@@ -401,6 +426,8 @@ def arrival_or_acts(results_dir, sid_ref, sid_cmp, layers=None, accept_step0=Fal
         against numerical noise, NOT calibrated on replicate clean runs
         (none exist on the final VWA data); stated as a limitation.
       no turn differs -> (None, 'not_exposed').
+    'volatile_only' (text differs only by run-time timestamps / keys): AgentDojo
+    -> (None, 'not_exposed') without the activation check; VWA -> scanned.
     VWA also scans 'length_differs_no_diff' pairs (identical text on every
     shared step, different episode lengths): an image payload can change the
     last shared decision without changing any text before it, so the episodes
@@ -409,6 +436,14 @@ def arrival_or_acts(results_dir, sid_ref, sid_cmp, layers=None, accept_step0=Fal
     greedy decoding cannot diverge with identical prompts.)
     Missing tensors -> (None, 'no_tensor')."""
     t, st = arrival_step(results_dir, sid_ref, sid_cmp, accept_step0)
+    if st == "volatile_only":
+        if not accept_step0:
+            # text differs only by run-time timestamps / keys: the payload never
+            # arrived. Unreached, like identical prompts -- but the activations
+            # legitimately differ (the timestamp is in the prompt), so the
+            # bit-identity check below does not apply.
+            return None, "not_exposed"
+        st = "not_exposed"          # VWA: the payload may be the image -> scan
     if st != "not_exposed" and not (accept_step0 and st == "length_differs_no_diff"):
         return t, st
     from pathlib import Path as _Path

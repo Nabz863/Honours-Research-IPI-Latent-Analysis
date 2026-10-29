@@ -11,6 +11,9 @@ seen in the 10-29 RQ2/stats runs. Prints evidence only; changes nothing.
 
   python3 analysis/diag_arrival.py delim final_agentdojo_gemma4 spotlighting_delimiting -n 3
   python3 analysis/diag_arrival.py vwa   final_vwa_gemma4 -n 3
+  pair:  the same episode in two run directories (reproducibility) -- first
+         differing step and the start of every differing message there.
+  python3 analysis/diag_arrival.py pair final_agentdojo_gemma4 repro_agentdojo_gemma4_griffin clean_travel_user_task_0_injection_task_4
 """
 import argparse
 import json
@@ -109,14 +112,40 @@ def vwa(d, n):
         print(f"no length_differs_no_diff pairs in {d}")
 
 
+def pair(d1, d2, sid):
+    t1 = read_transcript(Path(d1) / f"{sid}.transcript.json.gz")
+    t2 = read_transcript(Path(d2) / f"{sid}.transcript.json.gz")
+    if not t1 or not t2:
+        print(f"missing transcript: {d1 if not t1 else d2}/{sid}")
+        return
+    t = first_differing_step(t1, t2)
+    print(f"=== {sid}\n    steps {len(t1['steps'])}/{len(t2['steps'])}  first differing step {t}")
+    if t is None:
+        return
+    m1, m2 = step_conversation(t1, t), step_conversation(t2, t)
+    print(f"    messages at step {t}: {len(m1)} vs {len(m2)}")
+    for i, (x, y) in enumerate(zip(m1, m2)):
+        if x != y:
+            a, b = _msg_text(x), _msg_text(y)
+            k = next((j for j in range(min(len(a), len(b))) if a[j] != b[j]), min(len(a), len(b)))
+            print(f"    [{i}] role {x.get('role')}: first difference at char {k} (lengths {len(a)}/{len(b)})")
+            print(f"        {d1}: {a[max(0, k - 80):k + 160]!r}")
+            print(f"        {d2}: {b[max(0, k - 80):k + 160]!r}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["delim", "vwa"])
+    ap.add_argument("mode", choices=["delim", "vwa", "pair"])
     ap.add_argument("results_dir")
-    ap.add_argument("defence", nargs="?")
+    ap.add_argument("defence", nargs="?", help="delim: defence name; pair: second run directory")
+    ap.add_argument("sid", nargs="?", help="pair: sample id")
     ap.add_argument("-n", type=int, default=3)
     a = ap.parse_args()
-    if a.mode == "delim":
+    if a.mode == "pair":
+        if not (a.defence and a.sid):
+            ap.error("pair needs DIR_A DIR_B SID")
+        pair(a.results_dir, a.defence, a.sid)
+    elif a.mode == "delim":
         if not a.defence:
             ap.error("delim needs a defence name")
         delim(a.results_dir, a.defence, a.n)
