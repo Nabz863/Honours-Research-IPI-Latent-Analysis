@@ -325,6 +325,33 @@ def _load_turn(path, t):
 # every analysis measures the same decision as the RQ1 headline below.
 # ----------------------------------------------------------------------------
 
+_SPOTLIGHT_KEY = re.compile(r"SPOTLIGHT-[0-9a-f]{16}")
+
+
+def _mask_spotlight(tr):
+    """Copy of a transcript with spotlighting_delimiting's delimiter masked.
+    That defence names a delimiter derived from the tool output's content
+    (SPOTLIGHT-<16 hex>) in the tool result AND in the system message, so when
+    the payload arrives the system message changes too (diag_arrival, 10-29:
+    every delimiting pair was rejected for a differing system message whose
+    only difference is that key). Masking it lets check_arrival see that the
+    payload is the only real difference; any other change still rejects."""
+    def blk(b):
+        if isinstance(b, dict) and isinstance(b.get("text"), str):
+            return dict(b, text=_SPOTLIGHT_KEY.sub("SPOTLIGHT-#", b["text"]))
+        return b
+    def msg(m):
+        if not isinstance(m, dict):
+            return m
+        c = m.get("content")
+        if isinstance(c, str):
+            return dict(m, content=_SPOTLIGHT_KEY.sub("SPOTLIGHT-#", c))
+        if isinstance(c, list):
+            return dict(m, content=[blk(b) for b in c])
+        return m
+    return dict(tr, messages=[msg(m) for m in tr.get("messages", [])])
+
+
 def arrival_step(results_dir, sid_ref, sid_cmp, accept_step0=False):
     """(t, status) for two episodes of one task that differ only by the payload
     (clean vs attacked, or defended-clean vs defended-attacked under the same
@@ -348,7 +375,8 @@ def arrival_step(results_dir, sid_ref, sid_cmp, accept_step0=False):
         return None, ("not_exposed" if same else "length_differs_no_diff")
     if t == 0 and accept_step0:
         return 0, "ok"
-    if check_arrival(tr, tc, t) is not None:
+    if (check_arrival(tr, tc, t) is not None
+            and check_arrival(_mask_spotlight(tr), _mask_spotlight(tc), t) is not None):
         return None, "not_payload_arrival"
     return t, "ok"
 
@@ -373,14 +401,20 @@ def arrival_or_acts(results_dir, sid_ref, sid_cmp, layers=None, accept_step0=Fal
         against numerical noise, NOT calibrated on replicate clean runs
         (none exist on the final VWA data); stated as a limitation.
       no turn differs -> (None, 'not_exposed').
+    VWA also scans 'length_differs_no_diff' pairs (identical text on every
+    shared step, different episode lengths): an image payload can change the
+    last shared decision without changing any text before it, so the episodes
+    end at different steps. Scanned over the shared turns; no turn above
+    vwa_rel_tol keeps the status. (AgentDojo keeps it as an anomaly: text-only
+    greedy decoding cannot diverge with identical prompts.)
     Missing tensors -> (None, 'no_tensor')."""
     t, st = arrival_step(results_dir, sid_ref, sid_cmp, accept_step0)
-    if st != "not_exposed":
+    if st != "not_exposed" and not (accept_step0 and st == "length_differs_no_diff"):
         return t, st
     from pathlib import Path as _Path
     from experiments.attention_replay import read_transcript
     tr = read_transcript(_Path(results_dir) / (sid_ref + ".transcript.json.gz"))
-    n = len(tr.get("steps", [])) if tr else 1
+    n = len(tr.get("steps", [])) if tr else 1   # a shorter sid_cmp stops the scan (missing turn -> break)
     v = load_turns(results_dir, {sid_ref: set(range(n)), sid_cmp: set(range(n))}, ALL_LAYERS)
     if (sid_ref, 0) not in v or (sid_cmp, 0) not in v:
         return None, "no_tensor"
@@ -396,7 +430,7 @@ def arrival_or_acts(results_dir, sid_ref, sid_cmp, layers=None, accept_step0=Fal
                 return k, "ok_acts"
         elif max((np.abs(a[L] - b[L]).max() for L in shared), default=0.0) > abs_tol:
             return None, "prompt_same_acts_differ"
-    return None, "not_exposed"
+    return None, st
 
 
 def same_path(results_dir, sid_a, sid_b, t):

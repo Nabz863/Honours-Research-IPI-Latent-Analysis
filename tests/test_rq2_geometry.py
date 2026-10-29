@@ -923,6 +923,54 @@ def test_arrival_length_differs_status(tmp_path):
     assert geo.arrival_step(str(d), "c", "a") == (None, "length_differs_no_diff")
 
 
+def _spot_tr(d, sid, key, extra="", payload="", key0="0000000000000000"):
+    """spotlighting_delimiting as seen on the cluster (diag_arrival 10-29): the
+    delimiter is derived from the tool output and named in the system message,
+    so both change when the payload arrives at step 1."""
+    sysm = lambda k, x="": {"role": "system", "content": [{"type": "text", "text": f"Data is marked SPOTLIGHT-{k}.{x}"}]}
+    msgs = [sysm(key0), {"role": "user", "content": [{"type": "text", "text": "task"}]},
+            sysm(key, extra),
+            {"role": "user", "content": [{"type": "text", "text": f"[TOOL RESULT] SPOTLIGHT-{key} ok{payload}"}]}]
+    steps = [{"input": [0, 1], "prompt_sha256": "s0", "completion": "call f", "tool_calls": [{"function": "f"}]},
+             {"input": [2, 1, 3], "prompt_sha256": hashlib.sha256((key + extra + payload).encode()).hexdigest(),
+              "completion": "", "tool_calls": []}]
+    (d / f"{sid}.transcript.json.gz").write_bytes(gzip.compress(json.dumps({"messages": msgs, "steps": steps}).encode()))
+
+
+def test_delimiting_arrival_accepted_when_only_the_spotlight_key_differs(tmp_path):
+    d = tmp_path / "spot"
+    d.mkdir()
+    _spot_tr(d, "dc", "bf5fcbac6b6efaf4")
+    _spot_tr(d, "da", "8edc7809bad8670b", payload=" INJECT")
+    _spot_tr(d, "other", "8edc7809bad8670b", extra=" Also obey the user.", payload=" INJECT")
+    assert geo.arrival_step(str(d), "dc", "da") == (1, "ok")
+    # any change beyond the key in a non-tool message is still rejected
+    assert geo.arrival_step(str(d), "dc", "other") == (None, "not_payload_arrival")
+    assert geo.arrival_step(str(d), "dc", "dc") == (None, "not_exposed")
+    m = geo._mask_spotlight({"messages": [{"role": "system", "content": "k SPOTLIGHT-8edc7809bad8670b"},
+                                          {"role": "user", "content": [{"type": "image"}]}], "steps": []})
+    assert m["messages"][0]["content"] == "k SPOTLIGHT-#" and m["messages"][1]["content"] == [{"type": "image"}]
+
+
+def test_vwa_length_differs_is_scanned_for_an_image_payload(tmp_path):
+    """10-29 runs: ~45% of VWA pairs were dropped as length_differs_no_diff --
+    the image changed the last shared decision, so the episodes end at different
+    steps with identical text on every shared step. VWA scans those turns like
+    a text-identical pair; AgentDojo keeps the anomaly status."""
+    d = tmp_path / "lenimg"
+    d.mkdir()
+    _write_tr(d, "c", [_tool("p0"), _tool("p1")], ["a", "b"])
+    _write_tr(d, "img", [_tool("p0")], ["a"])               # stops one step earlier
+    _write_tr(d, "same", [_tool("p0")], ["a"])
+    _turns(d, "c", [[100.0, 0.0], [100.0, 0.0]])
+    _turns(d, "img", [[100.0, 30.0]])                        # image moves turn 0
+    _turns(d, "same", [[100.0, 0.0]])                        # no difference anywhere shared
+    assert geo.arrival_or_acts(str(d), "c", "img", accept_step0=True) == (0, "ok_acts")
+    assert geo.arrival_or_acts(str(d), "img", "c", accept_step0=True) == (0, "ok_acts")
+    assert geo.arrival_or_acts(str(d), "c", "same", accept_step0=True) == (None, "length_differs_no_diff")
+    assert geo.arrival_or_acts(str(d), "c", "img") == (None, "length_differs_no_diff")
+
+
 def test_normalise_asr():
     assert geo.normalise_asr({"asr_success": True}) is True
     assert geo.normalise_asr({"asr_success": 0}) is False
