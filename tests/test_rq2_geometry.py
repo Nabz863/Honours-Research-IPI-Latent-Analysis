@@ -947,9 +947,54 @@ def test_delimiting_arrival_accepted_when_only_the_spotlight_key_differs(tmp_pat
     # any change beyond the key in a non-tool message is still rejected
     assert geo.arrival_step(str(d), "dc", "other") == (None, "not_payload_arrival")
     assert geo.arrival_step(str(d), "dc", "dc") == (None, "not_exposed")
-    m = geo._mask_spotlight({"messages": [{"role": "system", "content": "k SPOTLIGHT-8edc7809bad8670b"},
+    m = geo._mask_volatile({"messages": [{"role": "system", "content": "k SPOTLIGHT-8edc7809bad8670b"},
                                           {"role": "user", "content": [{"type": "image"}]}], "steps": []})
     assert m["messages"][0]["content"] == "k SPOTLIGHT-#" and m["messages"][1]["content"] == [{"type": "image"}]
+
+
+def _ts_tr(d, sid, stamps, tools, comps=None):
+    """AgentDojo-like episode: step k sees system, task, then tool results
+    0..k-1; tool result i contains stamps[i] (a run-time last_modified)."""
+    msgs = [{"role": "system", "content": [{"type": "text", "text": "s"}]},
+            {"role": "user", "content": [{"type": "text", "text": "task"}]}]
+    for st, tx in zip(stamps, tools):
+        msgs.append({"role": "user", "content": [{"type": "text",
+                     "text": f"[TOOL RESULT] last_modified: {st}\\n{tx}"}]})
+    steps = []
+    for k in range(len(tools) + 1):
+        inp = [0, 1] + list(range(2, 2 + k))
+        steps.append({"input": inp, "prompt_sha256": hashlib.sha256(json.dumps([msgs[i] for i in inp]).encode()).hexdigest(),
+                      "completion": (comps or ["c"] * 9)[k], "tool_calls": [(comps or ["c"] * 9)[k]]})
+    (d / f"{sid}.transcript.json.gz").write_bytes(gzip.compress(json.dumps({"messages": msgs, "steps": steps}).encode()))
+
+
+def test_runtime_timestamp_is_not_the_payload(tmp_path):
+    """diag_exposure 10-29: 24 Qwen3-VL pairs per attack were 'reached' only
+    through a file's run-time last_modified; the payload never arrived."""
+    d = tmp_path / "ts"
+    d.mkdir()
+    A, B = "2026-10-08 15:04:01.711541", "2026-10-08 19:57:46.799653"
+    _ts_tr(d, "c", [A, A], ["file", "doc"])
+    _ts_tr(d, "noise", [B, B], ["file", "doc"])                 # only the stamps differ
+    _ts_tr(d, "late", [B, B], ["file", "doc INJECT"])           # stamp at step 1, payload at step 2
+    _ts_tr(d, "real", [B, B], ["file EXTRA", "doc"])            # a real difference next to the stamp
+    _ts_tr(d, "fixture", ["2024-05-26 19:00:00", A], ["file", "doc"])   # no microseconds: data, not noise
+    _turns(d, "c", [[0.0, 0.0]] * 3)
+    _turns(d, "noise", [[0.0, 0.0], [0.5, 0.0], [0.5, 0.0]])  # the stamp moves the activations
+    assert geo.arrival_step(str(d), "c", "noise") == (None, "volatile_only")
+    assert geo.arrival_or_acts(str(d), "c", "noise") == (None, "not_exposed")
+    assert geo.arrival_step(str(d), "c", "late") == (2, "ok")
+    assert geo.arrival_step(str(d), "c", "real") == (1, "ok")
+    assert geo.arrival_step(str(d), "c", "fixture") == (1, "ok")
+    assert geo._mask_text(f"x {A} SPOTLIGHT-8edc7809bad8670b") == "x <ts> SPOTLIGHT-#"
+    # review: the stamp changes the last shared decision, the clean episode ends,
+    # the attacked one continues (payload beyond the shared steps) -> not 'unexposed'
+    _ts_tr(d, "short", [A], ["file"])
+    _ts_tr(d, "long", [B, B], ["file", "doc INJECT"])
+    assert geo.arrival_step(str(d), "short", "long") == (None, "length_differs_no_diff")
+    _turns(d, "short", [[0.0, 0.0]] * 2)
+    _turns(d, "long", [[0.0, 0.0], [0.5, 0.0], [0.5, 0.0]])
+    assert geo.arrival_or_acts(str(d), "short", "long") == (None, "length_differs_no_diff")
 
 
 def test_vwa_length_differs_is_scanned_for_an_image_payload(tmp_path):
