@@ -151,9 +151,27 @@ def test_payload_turn_not_exposed(tmp_path):
     # identical to the clean transcript -> never diverges
     _transcript(d, sid, [st0, {"prompt_sha256": "cleanB", "input": [0, 1, 2], "completion": "", "tool_calls": []}],
                 sys_u + [_umsg("[TOOL RESULT] {\"result\": \"ok\"}")])
+    # identical prompts under greedy decoding give identical activations
+    _ep_turns(d, sid, [{31: [1.0, 1.0]}, {31: [2.0, 2.0]}])
     summ, exp = g.displacement_by_outcome_payload(str(d))
     assert exp["important_instructions"]["not_exposed"] == 1
     assert exp["important_instructions"]["exposed"] == 1
+
+
+def test_payload_turn_identical_prompts_but_different_activations(tmp_path):
+    """Text-identical prompts whose activations nevertheless differ cannot
+    happen on AgentDojo under greedy decoding: counted as an anomaly
+    (prompt_same_acts_differ), neither exposed nor silently unexposed."""
+    d = make_payload_turn(tmp_path)
+    sid = "important_instructions_workspace_user_task_0_injection_task_0"
+    sys_u = [{"role": "system", "content": [{"type": "text", "text": "s"}]}, _umsg("task")]
+    st0 = {"prompt_sha256": "same", "input": [0, 1], "completion": "call f", "tool_calls": [{"function": "f"}]}
+    _transcript(d, sid, [st0, {"prompt_sha256": "cleanB", "input": [0, 1, 2], "completion": "", "tool_calls": []}],
+                sys_u + [_umsg("[TOOL RESULT] {\"result\": \"ok\"}")])     # .pt still displaced
+    summ, exp = g.displacement_by_outcome_payload(str(d))
+    assert exp["important_instructions"]["prompt_same_acts_differ"] == 1
+    assert exp["important_instructions"]["exposed"] == 1
+    assert exp["important_instructions"]["not_exposed"] == 0
 
 
 def test_payload_turn_rejects_pre_payload_divergence(tmp_path):

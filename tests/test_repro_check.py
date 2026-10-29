@@ -1,10 +1,12 @@
-"""analysis/repro_check.py on a fixture: selection is fixed and eligible-only;
-compare finds identical and differing episodes."""
+"""analysis/repro_check.py compare: activations are compared only on turns whose
+prompts are identical (after divergence the inputs differ), and a non-finite
+value is never reported as bitwise equal."""
 import gzip
 import json
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 REPO = Path(__file__).resolve().parents[1]
@@ -12,57 +14,62 @@ sys.path.insert(0, str(REPO / "analysis"))
 import repro_check as rc  # noqa: E402
 
 
-def make(d: Path, perturb=None, users=None, gpu="RTX PRO 6000"):
-    d.mkdir()
-    rows = []
-    users = users or {"workspace": 4, "travel": 3, "banking": 3, "slack": 4}
-    for suite, n in users.items():
-        for u in range(n):
-            for i in range(2):
-                tid = f"{suite}_user_task_{u}_injection_task_{i}"
-                for s in rc.sids_for(tid):
-                    cond = "clean" if s.startswith("clean_") else "attacked"
-                    r = {"sample_id": s, "condition": cond, "task_id": tid, "suite_name": suite,
-                         "user_task_id": f"user_task_{u}", "injection_task_id": f"injection_task_{i}",
-                         "attack_name": s.split("_" + suite)[0], "asr_success": False, "utility_success": True,
-                         "tool_calls": [["f"]], "error": None, "code_version": {"harness_sha256": "h"},
-                         "run_settings": {"gpu_name": gpu}}
-                    rows.append(r)
-                    acts = [{0: torch.ones(4), 1: torch.arange(4.0)}]
-                    tr = {"steps": [{"prompt_sha256": "p", "completion": "c"}]}
-                    if perturb and s == perturb:
-                        r["asr_success"] = True
-                        acts = [{0: torch.ones(4) * 1.001, 1: torch.arange(4.0)}]
-                        tr = {"steps": [{"prompt_sha256": "p", "completion": "other"}]}
-                    torch.save(acts, d / f"{s}.pt")
-                    (d / f"{s}.transcript.json.gz").write_bytes(gzip.compress(json.dumps(tr).encode()))
-    (d / "attack_results.json").write_text(json.dumps(rows))
-    return d
+def _t(vals):
+    return [{31: torch.tensor(v, dtype=torch.float32)} for v in vals]
 
 
-def test_select_fixed_and_eligible(tmp_path):
-    d = make(tmp_path / "o")
-    rows = json.loads((d / "attack_results.json").read_text())
-    # make one workspace pair ineligible (errored ICON row) and one excluded (clean succeeds)
-    for r in rows:
-        if r["sample_id"] == "important_instructions_defended_icon_workspace_user_task_0_injection_task_0":
-            r["error"] = "x"
-        if r["sample_id"] == "clean_workspace_user_task_0_injection_task_1":
-            r["asr_success"] = True
-    (d / "attack_results.json").write_text(json.dumps(rows))
-    a, b = rc.select(d), rc.select(d)
-    assert a == b and len(a) == 50
-    assert not any("workspace_user_task_0_" in s for s in a)        # no eligible pair left for user_task_0
+def test_act_diff_nonfinite_is_not_bitwise():
+    a = _t([[1.0, 2.0]])
+    b = _t([[float("nan"), 2.0]])
+    r = rc._act_diff(a, b)
+    assert r["comparable"] is False and r.get("nonfinite")
 
 
-def test_compare(tmp_path):
-    o = make(tmp_path / "o")
-    sids = rc.select(o)
-    r = make(tmp_path / "r", perturb=sids[1])
-    s = rc.compare(o, r, tmp_path / "out", sids)
-    assert s["compared"] == 50 and s["asr_same"] == 49 and s["completions_same"] == 49
-    assert s["activations_bitwise"] == 49 and abs(s["activations_max_rel"] - 0.001) < 1e-4
-    assert s["prompts_same"] == 50 and s["code_hash_same"] == 50 and s["run_settings_differ"] == []
-    r2 = make(tmp_path / "r2", gpu="RTX 8000")
-    s2 = rc.compare(o, r2, tmp_path / "out2", sids)
-    assert s2["run_settings_differ"] == ["gpu_name"]
+def test_act_diff_only_prompt_identical_turns():
+    a = _t([[1.0, 2.0], [1.0, 2.0], [9.0, 9.0]])
+    b = _t([[1.0, 2.0], [1.0, 2.0001], [0.0, 0.0]])
+    r = rc._act_diff(a, b, n_turns=2)
+    assert r["comparable"] and r["turns_compared"] == 2
+    assert r["max_abs"] == pytest.approx(1e-4, rel=1e-2)
+    assert rc._act_diff(a, b, n_turns=0)["comparable"] is False
+
+
+def _episode(d, sid, prompts, comps, acts, gpu):
+    tr = {"steps": [{"prompt_sha256": p, "completion": c} for p, c in zip(prompts, comps)]}
+    (d / f"{sid}.transcript.json.gz").write_bytes(gzip.compress(json.dumps(tr).encode()))
+    torch.save(_t(acts), d / f"{sid}.pt")
+    return {"sample_id": sid, "attack_name": "clean", "task_id": "t", "asr_success": False,
+            "utility_success": True, "tool_calls": [], "code_version": {"harness_sha256": "h"},
+            "attack_sha256": "a", "run_settings": {"gpu_name": gpu}}
+
+
+def test_compare_cross_hardware_divergent_episode(tmp_path):
+    o, r = tmp_path / "orig", tmp_path / "rep"
+    o.mkdir(); r.mkdir()
+    # identical prompts for 2 steps, then the trajectories diverge
+    ro = _episode(o, "s1", ["p0", "p1", "p2"], ["c0", "c1", "c2"],
+                  [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], "RTX PRO 6000 Blackwell")
+    rr = _episode(r, "s1", ["p0", "p1", "pX"], ["c0", "cY", "c2"],
+                  [[1.0, 2.0], [3.0, 4.001], [50.0, 60.0]], "Quadro RTX 8000")
+    (o / "attack_results.json").write_text(json.dumps([ro]))
+    (r / "attack_results.json").write_text(json.dumps([rr]))
+    s = rc.compare(o, r, tmp_path / "out", ["s1"])
+    assert s["activations_compared"] == 1
+    assert s["activations_max_abs"] == pytest.approx(1e-3, rel=1e-2)    # not the 54 after divergence
+    ep = json.loads((tmp_path / "out" / "numbers.json").read_text())["episodes"][0]
+    assert ep["prompt_identical_turns"] == 2 and ep["activations"]["turns_compared"] == 2
+    assert "CROSS-HARDWARE" in (tmp_path / "out" / "report.md").read_text().splitlines()[0]
+
+
+
+def test_compare_without_transcript_does_not_compare_activations(tmp_path):
+    o, r = tmp_path / "o", tmp_path / "r"
+    o.mkdir(); r.mkdir()
+    row = {"sample_id": "s", "attack_name": "clean", "task_id": "t", "asr_success": False,
+           "utility_success": True, "tool_calls": [], "run_settings": {}}
+    for d in (o, r):
+        (d / "attack_results.json").write_text(json.dumps([row]))
+        torch.save(_t([[1.0], [2.0]]), d / "s.pt")
+    rc.compare(o, r, tmp_path / "out", ["s"])
+    ep = json.loads((tmp_path / "out" / "numbers.json").read_text())["episodes"][0]
+    assert ep["activations"] == {"comparable": False, "reason": "no transcript"}

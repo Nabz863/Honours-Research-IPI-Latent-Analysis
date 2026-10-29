@@ -220,7 +220,7 @@ def test_main_exits_nonzero_when_no_attack_is_analysable(tmp_path, monkeypatch):
         _row_e(rows, f"tipi_{tid}", "attacked", "template_ipi", tid)
     (d / "attack_results.json").write_text(json.dumps(rows))
     out = tmp_path / "o" / "h.json"
-    monkeypatch.setattr(sys, "argv", ["persistent_homology.py", "--results_dir", str(d),
+    monkeypatch.setattr(sys, "argv", ["persistent_homology.py", "--turn_strategy", "mean", "--results_dir", str(d),
                                       "--layer", str(L), "--n_perm", "5", "--out", str(out)])
     with pytest.raises(SystemExit) as ex:
         ph.main()
@@ -259,7 +259,7 @@ def _rq3_dir(d, seed, effect=None, n_users=30, n_reached=15, n_inj=3, dim=16):
 
 
 def _run_main(d, out, monkeypatch, n_perm=100):
-    monkeypatch.setattr(sys, "argv", ["persistent_homology.py", "--results_dir", str(d),
+    monkeypatch.setattr(sys, "argv", ["persistent_homology.py", "--turn_strategy", "mean", "--results_dir", str(d),
                                       "--layer", str(L), "--n_perm", str(n_perm),
                                       "--min_points", "10", "--out", str(out)])
     ph.main()
@@ -380,7 +380,7 @@ def test_main_subsamples_pairs_together(tmp_path, monkeypatch):
     monkeypatch.setattr(ph, "preprocess", pre)
     monkeypatch.setattr(ph, "compare", cmp)
     d = _rq3_dir(tmp_path / "d", 3, n_users=30, n_reached=24)
-    monkeypatch.setattr(sys, "argv", ["persistent_homology.py", "--results_dir", str(d),
+    monkeypatch.setattr(sys, "argv", ["persistent_homology.py", "--turn_strategy", "mean", "--results_dir", str(d),
                                       "--layer", str(L), "--n_perm", "5", "--max_points", "12",
                                       "--out", str(tmp_path / "o.json")])
     ph.main()
@@ -402,3 +402,133 @@ def test_paired_grid_skips_within_pair_distances():
         dth = ph._h0_union_find(cloud)[:, 1]
         dth = dth[np.isfinite(dth)]
         assert radii[0] <= dth.min() and dth.max() <= radii[-1]
+
+
+# --- payload-arrival turn ----------------------------------------------------
+import gzip, hashlib  # noqa: E402
+
+
+def _tr(d, sid, msgs, comps):
+    steps = [{"input": list(range(k + 1)),
+              "prompt_sha256": hashlib.sha256(json.dumps(msgs[: k + 1]).encode()).hexdigest(),
+              "completion": c, "tool_calls": [c]} for k, c in enumerate(comps)]
+    (d / f"{sid}.transcript.json.gz").write_bytes(
+        gzip.compress(json.dumps({"messages": msgs, "steps": steps}).encode()))
+
+
+def test_arrival_pairs_use_the_arrival_step(tmp_path):
+    d = tmp_path / "arr"
+    d.mkdir()
+    S = {"role": "system", "content": [{"type": "text", "text": "s"}]}
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for u in range(6):
+        tid = f"workspace_user_task_{u}_injection_task_0"
+        cm = [S, T("ok"), T("more")]
+        am = [S, T("ok PAYLOAD"), T("more")] if u < 4 else cm          # 4 reached, 2 never exposed
+        _tr(d, f"clean_{tid}", cm, ["x", "y", "z"])
+        _tr(d, f"tipi_{tid}", am, ["x", "y", "z"])
+        _ep(d, f"clean_{tid}", [[50.0, 50, 50], [u, 0.0, 0.0], [-50.0, 9, 9]])
+        _ep(d, f"tipi_{tid}", [[50.0, 50, 50], [u, 5.0, 0.0], [-50.0, -9, 9]] if u < 4 else
+            [[50.0, 50, 50], [u, 0.0, 0.0], [-50.0, 9, 9]])        # unexposed: identical states
+        _row_e(rows, f"clean_{tid}", "clean", "clean", tid)
+        _row_e(rows, f"tipi_{tid}", "attacked", "template_ipi", tid)
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    info = {}
+    cbt, _, att = ph._load_undefended(str(d), L, "arrival", info=info)
+    assert info["template_ipi"] == {"ok": 4, "not_exposed": 2}
+    C, A, groups = ph.matched_pairs(cbt, att)["template_ipi"]
+    assert len(groups) == 4
+    assert np.allclose(A - C, [[0.0, 5.0, 0.0]] * 4)                  # turn-1 displacement only
+    _, cinfo = ph._clouds_from(cbt, len(cbt), att, return_info=True)
+    assert cinfo["template_ipi"]["n_zero_delta"] == 2
+
+
+
+def test_arrival_each_attack_pairs_with_its_own_clean_step(tmp_path):
+    """Two attacks on one task arriving at different steps: each attacked
+    point is paired with the clean state at ITS arrival step, not with
+    whichever clean vector was stored first for the task."""
+    d = tmp_path / "two"
+    d.mkdir()
+    S = {"role": "system", "content": [{"type": "text", "text": "s"}]}
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for u in range(4):
+        tid = f"workspace_user_task_{u}_injection_task_0"
+        cm = [S, T("a"), T("b"), T("c")]
+        _tr(d, f"clean_{tid}", cm, ["x", "y", "z", "w"])
+        _ep(d, f"clean_{tid}", [[0.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0], [3.0, 0, 0]])
+        _row_e(rows, f"clean_{tid}", "clean", "clean", tid)
+        _tr(d, f"early_{tid}", [S, T("a P"), T("b"), T("c")], ["x", "y", "z", "w"])     # arrives at 1
+        _ep(d, f"early_{tid}", [[0.0, 0, 0], [1.0, 7, 0], [2.0, 0, 0], [3.0, 0, 0]])
+        _row_e(rows, f"early_{tid}", "attacked", "early", tid)
+        _tr(d, f"late_{tid}", [S, T("a"), T("b P"), T("c")], ["x", "y", "z", "w"])      # arrives at 2
+        _ep(d, f"late_{tid}", [[0.0, 0, 0], [1.0, 0, 0], [2.0, 0, 9], [3.0, 0, 0]])
+        _row_e(rows, f"late_{tid}", "attacked", "late", tid)
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    cbt, _, att = ph._load_undefended(str(d), L, "arrival")
+    mp = ph.matched_pairs(cbt, att)
+    assert np.allclose(mp["early"][1] - mp["early"][0], [[0, 7, 0]] * 4)
+    assert np.allclose(mp["late"][1] - mp["late"][0], [[0, 0, 9]] * 4)
+
+
+
+def test_homology_arrival_counts_missing_tensors(tmp_path):
+    d = tmp_path / "mt"
+    d.mkdir()
+    S = {"role": "system", "content": [{"type": "text", "text": "s"}]}
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for u in range(3):
+        tid = f"workspace_user_task_{u}_injection_task_0"
+        _tr(d, f"clean_{tid}", [S, T("a"), T("b")], ["x", "y", "z"])
+        _ep(d, f"clean_{tid}", [[0.0, 0, 0], [1.0, 0, 0], [0.0, 0, 0]])
+        _row_e(rows, f"clean_{tid}", "clean", "clean", tid)
+        _tr(d, f"tipi_{tid}", [S, T("a P"), T("b")], ["x", "y", "z"])
+        if u:                                                     # task 0's attacked tensor is missing
+            _ep(d, f"tipi_{tid}", [[0.0, 0, 0], [1.0, 4, 0], [0.0, 0, 0]])
+        _row_e(rows, f"tipi_{tid}", "attacked", "template_ipi", tid)
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    info = {}
+    _, _, att = ph._load_undefended(str(d), L, "arrival", info=info)
+    assert info["template_ipi"]["no_tensor"] == 1 and len(att["template_ipi"]) == 2
+
+
+def test_homology_empty_writes_json_and_hints(tmp_path, monkeypatch):
+    d = tmp_path / "v"
+    d.mkdir()
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for i in range(3):
+        tid = f"reddit_{i}_x"
+        for sid, cond, atk, txt in [(f"clean_{tid}", "clean", "clean", "page"), (f"t_{tid}", "attacked", "A", "page P")]:
+            _row_e(rows, sid, cond, atk, tid)
+            _tr(d, sid, [T(txt)], ["act"])
+            _ep(d, sid, [[1.0, float("P" in txt), 0.0]])
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    out = tmp_path / "o" / "h.json"
+    monkeypatch.setattr(sys, "argv", ["persistent_homology.py", "--results_dir", str(d), "--layer", str(L),
+                                      "--n_perm", "5", "--out", str(out)])
+    with pytest.raises(SystemExit) as ex:
+        ph.main()
+    assert "--accept_step0" in str(ex.value.code)
+    assert json.loads(out.read_text())["arrival"]["A"]["not_payload_arrival"] == 3
+
+
+def test_homology_loader_handles_image_only_payloads(tmp_path):
+    d = tmp_path / "img"
+    d.mkdir()
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for i in range(4):
+        tid = f"reddit_{i}_x"
+        for sid, cond, atk, v in [(f"clean_{tid}", "clean", "clean", [float(i), 0, 0]),
+                                  (f"t_{tid}", "attacked", "A", [float(i), 3, 0])]:
+            _row_e(rows, sid, cond, atk, tid)
+            _tr(d, sid, [T("page")], ["act"])
+            _ep(d, sid, [v])
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    info = {}
+    _, _, att = ph._load_undefended(str(d), L, "arrival", accept_step0=True, info=info)
+    assert info["A"] == {"ok_acts": 4} and len(att["A"]) == 4

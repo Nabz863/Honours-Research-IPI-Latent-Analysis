@@ -63,15 +63,24 @@ ZERO_TOL = 1e-6
 # One grouping key and one effect size across the analysis scripts
 # (geometry.py sits next to this file).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from geometry import user_task_group, matched_rank_biserial  # noqa: E402
+from geometry import (user_task_group, matched_rank_biserial, arrival_or_acts,  # noqa: E402
+                      load_turns, normalise_asr)
 
 
 # --------------------------------------------------------------------------
 # loading
 # --------------------------------------------------------------------------
 
-def load_pairs(results_dir, layer):
-    """{attack: [(task_id, group, h_clean, h_adv, asr), ...]}"""
+def load_pairs(results_dir, layer, turn="mean", accept_step0=False, info=None):
+    """{attack: [(task_id, group, h_clean, h_adv, asr), ...]}
+
+    turn='mean': mean over all turns. turn='arrival': both states at the
+    payload's arrival step (geometry.arrival_step), the decision the RQ1
+    headline measures. An unexposed pair (prompts identical throughout) is
+    kept with h_adv = h_clean, so it counts as unreached exactly as a
+    zero-delta pair does under 'mean'. A pair whose first difference is not
+    the payload arriving, or without transcripts, is excluded and counted in
+    info[attack][status]."""
     rows = json.load(open(os.path.join(results_dir, "attack_results.json")))
     by_task = defaultdict(dict)
     for r in rows:
@@ -79,6 +88,9 @@ def load_pairs(results_dir, layer):
             continue
         if r.get("defense_name") in (None, "none"):
             by_task[r["task_id"]][r["attack_name"]] = r
+    if turn == "arrival":
+        return _pairs_at_arrival(results_dir, layer, by_task, accept_step0,
+                                 info if info is not None else {})
 
     def vec(sample_id):
         p = os.path.join(results_dir, sample_id + ".pt")
@@ -109,8 +121,39 @@ def load_pairs(results_dir, layer):
                 continue
             # audit register: scoring_error_final rows are excluded from ASR
             # (unscored, like asr None) -- the activations are still valid.
-            asr = None if r.get("scoring_error_final") else r.get("asr_success")
-            out[attack].append((task_id, group, hc, ha, asr))
+            out[attack].append((task_id, group, hc, ha, normalise_asr(r)))
+    return out
+
+
+def _pairs_at_arrival(results_dir, layer, by_task, accept_step0, info):
+    plan = []
+    needs = defaultdict(set)
+    for task_id, conds in by_task.items():
+        if "clean" not in conds:
+            continue
+        c_sid = conds["clean"]["sample_id"]
+        for attack, r in conds.items():
+            if attack == "clean":
+                continue
+            t, st = arrival_or_acts(results_dir, c_sid, r["sample_id"], accept_step0=accept_step0)
+            ia = info.setdefault(attack, {})
+            ia[st] = ia.get(st, 0) + 1
+            if st == "not_exposed":
+                plan.append((task_id, attack, r, c_sid, 0, c_sid, 0))     # h_adv := h_clean
+                needs[c_sid].add(0)
+            elif t is not None:
+                plan.append((task_id, attack, r, c_sid, t, r["sample_id"], t))
+                needs[c_sid].add(t)
+                needs[r["sample_id"]].add(t)
+    vec = load_turns(results_dir, needs, [layer])
+    out = defaultdict(list)
+    for task_id, attack, r, c_sid, tc, a_sid, ta in plan:
+        hc = vec.get((c_sid, tc), {}).get(layer)
+        ha = vec.get((a_sid, ta), {}).get(layer)
+        if hc is None or ha is None:
+            info[attack]["no_tensor"] = info[attack].get("no_tensor", 0) + 1
+            continue
+        out[attack].append((task_id, user_task_group(task_id), hc, ha, normalise_asr(r)))
     return out
 
 
@@ -245,7 +288,7 @@ def compare_attacks(pairs, nonzero_only=True):
 def holm(entries, key_in, key_out):
     """Holm-Bonferroni step-down. Controls family-wise error without
     Bonferroni's conservatism."""
-    have = [e for e in entries if e.get(key_in) is not None]
+    have = [e for e in entries if e.get(key_in) is not None and np.isfinite(e[key_in])]
     m = len(have)
     for rank, e in enumerate(sorted(have, key=lambda x: x[key_in])):
         e[key_out] = float(min(1.0, e[key_in] * (m - rank)))
@@ -485,12 +528,29 @@ def main():
     ap.add_argument("--results_dir", required=True)
     ap.add_argument("--layer", type=int, default=31)
     ap.add_argument("--n_perm", type=int, default=200)
+    ap.add_argument("--turn", default="arrival", choices=["arrival", "mean"],
+                    help="arrival (default): both states at the payload's arrival step "
+                         "(the RQ1 headline's decision); mean: mean over all turns")
+    ap.add_argument("--accept_step0", action="store_true",
+                    help="payload is in the first observation (VWA): accept arrival at step 0")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
-    pairs = load_pairs(a.results_dir, a.layer)
+    arrival_info = {}
+    pairs = load_pairs(a.results_dir, a.layer, turn=a.turn, accept_step0=a.accept_step0,
+                       info=arrival_info)
     if not pairs:
-        sys.exit("no usable pairs -- check that --layer exists in the saved "
+        if a.out:
+            os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+            with open(a.out + ".tmp", "w") as fh:
+                json.dump({"config": vars(a), "arrival": arrival_info}, fh, indent=2)
+            os.replace(a.out + ".tmp", a.out)
+        hint = ""
+        if a.turn == "arrival" and not a.accept_step0 and any(
+                v.get("not_payload_arrival") for v in arrival_info.values()):
+            hint = ("arrival pairing " + json.dumps(arrival_info)[:300]
+                    + " -- payload in the first observation (VWA)? pass --accept_step0. ")
+        sys.exit("no usable pairs -- " + hint + "Or check that --layer exists in the saved "
                  "tensors for this model. Layer bands differ by architecture: "
                  "18-31 for a 32-layer stack, 24-42 for Gemma's 48-layer one, "
                  "so a layer valid for one model may be absent or mid-stack "
@@ -530,12 +590,12 @@ def main():
         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
         tmp = a.out + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump({"config": vars(a), "reachability": reach,
+            json.dump({"config": vars(a), "arrival": arrival_info, "reachability": reach,
                        "attack_comparison": cmp_, "probe": prb,
                        "reach_vs_asr": rva}, fh, indent=2, default=float)
         os.replace(tmp, a.out)
 
-    print_report(a, reach, cmp_, prb, rva)
+    print_report(a, reach, cmp_, prb, rva, arrival_info)
     if a.out:
         print(f"wrote {a.out}")
 
@@ -548,8 +608,13 @@ def _fmt(v, spec, width=0):
     return s.rjust(width) if width else s
 
 
-def print_report(a, reach, cmp_, prb, rva):
-    print(f"\n=== {a.results_dir}  layer {a.layer} ===\n")
+def print_report(a, reach, cmp_, prb, rva, arrival_info=None):
+    print(f"\n=== {a.results_dir}  layer {a.layer}  turn={getattr(a, 'turn', 'mean')} ===\n")
+    if arrival_info:
+        print("payload-arrival pairing (unexposed pairs count as unreached; the rest excluded):")
+        for k, v in sorted(arrival_info.items()):
+            print(f"   {k:24s} " + ", ".join(f"{s_}={n}" for s_, n in sorted(v.items())))
+        print()
 
     print("1. REACHABILITY (fraction of episodes with non-zero delta; 95% CI on the\n"
           "   user-task-clustered effective n)")

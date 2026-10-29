@@ -64,7 +64,7 @@ except ImportError:
 # for `python -m` and tests:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from geometry import (load_rows, tensor_path, load_episode, CLEAN_NAME,  # noqa: E402
-                      user_task_group)
+                      user_task_group, arrival_or_acts, load_turns)
 
 try:
     from ripser import ripser as _ripser
@@ -121,9 +121,16 @@ def clouds(results_dir, layer, turn_strategy="mean", return_info=False):
     return _clouds_from(clean_by_task, n_clean_loaded, attacked, return_info)
 
 
-def _load_undefended(results_dir, layer, turn_strategy):
-    """(clean_by_task {task_id: vec}, n_clean_loaded, attacked {label: [(task_id, vec)]})
-    for undefended, non-errored rows at `layer`."""
+def _load_undefended(results_dir, layer, turn_strategy, accept_step0=False, info=None):
+    """(clean_by_task {task_id: vec}, n_clean_loaded, attacked {label: [(task_id, vec[, clean_vec])]})
+    for undefended, non-errored rows at `layer`.
+    turn_strategy 'arrival': each attacked item carries its own clean vector,
+    both at the payload's arrival step (geometry.arrival_step); an unexposed
+    pair carries attacked = clean (zero-delta, excluded downstream and
+    counted); a non-arrival or transcript-less pair is dropped and counted in
+    info[label][status]."""
+    if turn_strategy == "arrival":
+        return _load_arrival(results_dir, layer, accept_step0, info if info is not None else {})
     rows = load_rows(results_dir)
     clean_by_task = {}
     n_clean_loaded = 0
@@ -148,6 +155,52 @@ def _load_undefended(results_dir, layer, turn_strategy):
     return clean_by_task, n_clean_loaded, attacked
 
 
+def _load_arrival(results_dir, layer, accept_step0, info):
+    rows = load_rows(results_dir)
+    clean, att = {}, defaultdict(list)
+    for r in rows:
+        if r.get("error") or r.get("defense_name") not in (None, "none"):
+            continue
+        if r.get("condition") == "clean":
+            clean[r.get("task_id")] = r["sample_id"]
+        elif r.get("condition") == "attacked":
+            att[r.get("attack_name")].append((r.get("task_id"), r["sample_id"]))
+    plan, needs = [], defaultdict(set)
+    for label, items in att.items():
+        il = info.setdefault(label, {})
+        for tid, a_sid in items:
+            c_sid = clean.get(tid)
+            if c_sid is None:
+                il["no_clean"] = il.get("no_clean", 0) + 1
+                continue
+            t, st = arrival_or_acts(results_dir, c_sid, a_sid, accept_step0=accept_step0)
+            il[st] = il.get(st, 0) + 1
+            if st == "not_exposed":
+                plan.append((label, tid, c_sid, 0, c_sid, 0))
+                needs[c_sid].add(0)
+            elif t is not None:
+                plan.append((label, tid, c_sid, t, a_sid, t))
+                needs[c_sid].add(t)
+                needs[a_sid].add(t)
+    vec = load_turns(results_dir, needs, [layer])
+    clean_by_task, attacked = {}, defaultdict(list)
+    for label, tid, c_sid, tc, a_sid, ta in plan:
+        c = vec.get((c_sid, tc), {}).get(layer)
+        v = vec.get((a_sid, ta), {}).get(layer)
+        if c is None or v is None:                      # never silently dropped
+            info[label]["no_tensor"] = info[label].get("no_tensor", 0) + 1
+            continue
+        c, v = np.asarray(c, np.float64), np.asarray(v, np.float64)
+        clean_by_task.setdefault(tid, c)
+        attacked[label].append((tid, v, c))
+    return clean_by_task, len(clean_by_task), attacked
+
+
+def _partner(clean_by_task, item):
+    """the attacked item's clean partner: its own (arrival mode) or by task_id."""
+    return item[2] if len(item) > 2 else clean_by_task.get(item[0])
+
+
 def _clouds_from(clean_by_task, n_clean_loaded, attacked, return_info=False):
     out, info = {}, {}
     if clean_by_task:
@@ -156,8 +209,8 @@ def _clouds_from(clean_by_task, n_clean_loaded, attacked, return_info=False):
                             "n_unique": int(len(out[CLEAN_NAME]))}
     for label, items in attacked.items():
         reached, n_no_clean, n_zero = [], 0, 0
-        for tid, v in items:
-            c = clean_by_task.get(tid)
+        for item in items:
+            v, c = item[1], _partner(clean_by_task, item)
             if c is None or c.shape != v.shape:
                 n_no_clean += 1
             elif np.linalg.norm(v - c) <= ZERO_TOL:
@@ -190,8 +243,8 @@ def matched_pairs(clean_by_task, attacked):
     out = {}
     for label, items in attacked.items():
         byg = defaultdict(lambda: ([], []))
-        for tid, v in items:
-            c = clean_by_task.get(tid)
+        for item in items:
+            tid, v, c = item[0], item[1], _partner(clean_by_task, item)
             if c is None or c.shape != v.shape or np.linalg.norm(v - c) <= ZERO_TOL:
                 continue
             g = user_task_group(tid)
@@ -428,7 +481,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results_dir", required=True)
     ap.add_argument("--layer", type=int, default=31)
-    ap.add_argument("--turn_strategy", default="mean", choices=["first", "mean", "last"])
+    ap.add_argument("--turn_strategy", default="arrival", choices=["arrival", "first", "mean", "last"],
+                    help="arrival (default): clean and attacked at the payload's arrival step, "
+                         "the RQ1 headline's decision")
+    ap.add_argument("--accept_step0", action="store_true",
+                    help="payload is in the first observation (VWA): accept arrival at step 0")
     ap.add_argument("--pca_dim", type=int, default=50)
     ap.add_argument("--max_points", type=int, default=150,
                     help="cap per cloud; Vietoris-Rips is superlinear")
@@ -448,14 +505,30 @@ def main():
         print("[warn] persim not installed -- bottleneck/Wasserstein diagram "
               "distances skipped (Betti-curve test still runs).\n")
 
-    cbt, n_cl, att = _load_undefended(a.results_dir, a.layer, a.turn_strategy)
+    arrival_info = {}
+    cbt, n_cl, att = _load_undefended(a.results_dir, a.layer, a.turn_strategy,
+                                      a.accept_step0, arrival_info)
     cl, cinfo = _clouds_from(cbt, n_cl, att, return_info=True)
     matched = matched_pairs(cbt, att)
     if CLEAN_NAME not in cl:
-        sys.exit(f"no clean cloud at layer {a.layer} in {a.results_dir}")
+        if a.out:
+            os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+            with open(a.out + ".tmp", "w") as fh:
+                json.dump({"config": vars(a), "arrival": arrival_info, "per_attack": {}}, fh, indent=2)
+            os.replace(a.out + ".tmp", a.out)
+        hint = ""
+        if a.turn_strategy == "arrival" and not a.accept_step0 and any(
+                v.get("not_payload_arrival") for v in arrival_info.values()):
+            hint = " -- payload in the first observation (VWA)? pass --accept_step0"
+        sys.exit(f"no clean cloud at layer {a.layer} in {a.results_dir}: "
+                 f"arrival pairing {json.dumps(arrival_info)[:300]}{hint}")
     clean = cl[CLEAN_NAME]
     print(f"\n=== persistent homology  ({a.results_dir}, layer {a.layer}, "
           f"turns={a.turn_strategy}) ===")
+    if arrival_info:
+        print("payload-arrival pairing: " + "; ".join(
+            f"{k}: " + ", ".join(f"{s_}={n}" for s_, n in sorted(v.items()))
+            for k, v in sorted(arrival_info.items())))
     print(f"backend: {'ripser (H0+H1)' if HAVE_RIPSER else 'union-find (H0 only)'}"
           f"{' + persim' if HAVE_PERSIM else ''}")
     ci = cinfo[CLEAN_NAME]
@@ -470,6 +543,7 @@ def main():
     out = {"config": vars(a),
            "backend": {"ripser": HAVE_RIPSER, "persim": HAVE_PERSIM},
            "clouds": cinfo,     # finding 7: what each cloud excluded
+           "arrival": arrival_info,
            "per_attack": {}}
     for label in sorted(l for l in cinfo if l != CLEAN_NAME):
         C, A, groups = matched.get(label, (np.empty((0, 0)), np.empty((0, 0)), []))

@@ -277,7 +277,7 @@ def per_condition_geometry_by_outcome(paired):
             if attack == CLEAN_NAME:
                 continue
             # audit register: scoring_error_final rows are unscored, not failures
-            s = None if entry["row"].get("scoring_error_final") else entry["row"].get("asr_success")
+            s = normalise_asr(entry["row"])
             outcome = "success" if s is True else ("failure" if s is False else "unscored")
             for layer, h_adv in entry["acts"].items():
                 h_cln = clean.get(layer)
@@ -320,7 +320,148 @@ def _load_turn(path, t):
     return {int(L): v.detach().float().cpu().numpy() for L, v in turns[t].items()}
 
 
-def displacement_by_outcome_payload(results_dir, attacks=None):
+# ----------------------------------------------------------------------------
+# Payload-arrival turn, shared by rq2_geometry / stats / persistent_homology so
+# every analysis measures the same decision as the RQ1 headline below.
+# ----------------------------------------------------------------------------
+
+def arrival_step(results_dir, sid_ref, sid_cmp, accept_step0=False):
+    """(t, status) for two episodes of one task that differ only by the payload
+    (clean vs attacked, or defended-clean vs defended-attacked under the same
+    defence). t = the first step whose prompt differs (prompt_sha256), accepted
+    as the payload's arrival by attention_replay.check_arrival: the episodes
+    did the same at t-1 and every differing message is a tool result.
+    accept_step0: a benchmark whose payload is in the FIRST observation (VWA:
+    the page) differs at step 0 by construction; accept t = 0 there.
+    status: ok | not_exposed (prompts identical throughout) | no_transcript |
+    not_payload_arrival | length_differs_no_diff."""
+    from pathlib import Path as _Path
+    from experiments.attention_replay import read_transcript, first_differing_step, check_arrival
+    d = _Path(results_dir)
+    tr = read_transcript(d / (sid_ref + ".transcript.json.gz"))
+    tc = read_transcript(d / (sid_cmp + ".transcript.json.gz"))
+    if tr is None or tc is None:
+        return None, "no_transcript"
+    t = first_differing_step(tr, tc)
+    if t is None:
+        same = len(tr.get("steps", [])) == len(tc.get("steps", []))
+        return None, ("not_exposed" if same else "length_differs_no_diff")
+    if t == 0 and accept_step0:
+        return 0, "ok"
+    if check_arrival(tr, tc, t) is not None:
+        return None, "not_payload_arrival"
+    return t, "ok"
+
+
+ALL_LAYERS = range(0, 512)      # every layer a .pt may hold
+
+
+def arrival_or_acts(results_dir, sid_ref, sid_cmp, layers=None, accept_step0=False,
+                    abs_tol=1e-6, vwa_rel_tol=1e-2):
+    """arrival_step, plus a check that 'not_exposed' really means unexposed.
+    prompt_sha256 hashes the TEXT prompt only: a payload carried by an image
+    leaves every text prompt identical while the activations differ. For a
+    text-identical pair the two episodes are compared turn by turn on EVERY
+    stored layer (not the caller's analysis layer, so every analysis
+    classifies a pair identically -- review round 9; `layers` is ignored):
+      AgentDojo (accept_step0 False): greedy decoding on one GPU makes an
+        unexposed pair bit-identical, so ANY difference (> abs_tol) is
+        anomalous -> (None, 'prompt_same_acts_differ'), excluded and counted.
+      VWA (accept_step0 True): the first turn whose relative difference
+        ||a-b|| / ||a|| (max over layers) exceeds vwa_rel_tol is the image
+        payload's arrival -> (t, 'ok_acts'). vwa_rel_tol is a fixed guard
+        against numerical noise, NOT calibrated on replicate clean runs
+        (none exist on the final VWA data); stated as a limitation.
+      no turn differs -> (None, 'not_exposed').
+    Missing tensors -> (None, 'no_tensor')."""
+    t, st = arrival_step(results_dir, sid_ref, sid_cmp, accept_step0)
+    if st != "not_exposed":
+        return t, st
+    from pathlib import Path as _Path
+    from experiments.attention_replay import read_transcript
+    tr = read_transcript(_Path(results_dir) / (sid_ref + ".transcript.json.gz"))
+    n = len(tr.get("steps", [])) if tr else 1
+    v = load_turns(results_dir, {sid_ref: set(range(n)), sid_cmp: set(range(n))}, ALL_LAYERS)
+    if (sid_ref, 0) not in v or (sid_cmp, 0) not in v:
+        return None, "no_tensor"
+    for k in range(n):
+        a, b = v.get((sid_ref, k)), v.get((sid_cmp, k))
+        if a is None or b is None:
+            break
+        shared = [L for L in a if L in b]
+        if accept_step0:
+            rel = max((np.linalg.norm(a[L] - b[L]) / max(np.linalg.norm(a[L]), 1e-12) for L in shared),
+                      default=0.0)
+            if rel > vwa_rel_tol:
+                return k, "ok_acts"
+        elif max((np.abs(a[L] - b[L]).max() for L in shared), default=0.0) > abs_tol:
+            return None, "prompt_same_acts_differ"
+    return None, "not_exposed"
+
+
+def same_path(results_dir, sid_a, sid_b, t):
+    """True if the two episodes made the same tool calls at every step before
+    t (the defended and undefended trajectories reached step t the same way).
+    None if a transcript is missing."""
+    from pathlib import Path as _Path
+    from experiments.attention_replay import read_transcript
+    d = _Path(results_dir)
+    ta = read_transcript(d / (sid_a + ".transcript.json.gz"))
+    tb = read_transcript(d / (sid_b + ".transcript.json.gz"))
+    if ta is None or tb is None:
+        return None
+    sa, sb = ta.get("steps", []), tb.get("steps", [])
+    if len(sa) < t or len(sb) < t:
+        return False
+    # The action is the tool call where there is one (AgentDojo: a defence
+    # changes the free text of the completion without changing the call);
+    # only when neither step has tool calls (VWA) is the completion the action.
+    def act(step):
+        return step.get("tool_calls") if step.get("tool_calls") else ("completion", step.get("completion"))
+    return all(act(sa[k]) == act(sb[k]) for k in range(t))
+
+
+def normalise_asr(row):
+    """The one ASR rule every analysis uses: True / False, or None = unscored.
+    scoring_error_final rows are unscored (audit register); 0/1 integers are
+    scores; anything else (missing, strings) is unscored."""
+    if row.get("scoring_error_final"):
+        return None
+    v = row.get("asr_success")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, np.integer)) and v in (0, 1):
+        return bool(v)
+    return None
+
+
+def load_turns(results_dir, needs, layers):
+    """{(sid, t): {layer: np.float32[d]}} reading each .pt ONCE for all the
+    turns and layers asked of it. needs: {sid: set(t)}. A missing file, an
+    unreadable one, or a turn beyond the episode's length is simply absent."""
+    layers = set(int(L) for L in layers)
+    out = {}
+    for sid, ts in needs.items():
+        p = os.path.join(results_dir, sid + ".pt")
+        try:
+            try:
+                turns = torch.load(p, map_location="cpu", weights_only=True)
+            except TypeError:
+                turns = torch.load(p, map_location="cpu")
+        except Exception:
+            continue
+        if not isinstance(turns, list):
+            continue
+        for t in ts:
+            if 0 <= t < len(turns) and isinstance(turns[t], dict):
+                v = {int(L): x.detach().float().cpu().numpy() for L, x in turns[t].items()
+                     if int(L) in layers}
+                if v:
+                    out[(sid, t)] = v
+    return out
+
+
+def displacement_by_outcome_payload(results_dir, attacks=None, accept_step0=False):
     """RQ1 headline, measured at the PAYLOAD'S ARRIVAL turn, not turn 0.
 
     For each undefended attacked episode, the arrival turn t is the first step
@@ -359,24 +500,20 @@ def displacement_by_outcome_payload(results_dir, attacks=None):
         if clean is None:
             exposure[attack]["no_clean"] += 1
             continue
-        ct = read_transcript(_Path(results_dir) / (clean["sample_id"] + ".transcript.json.gz"))
-        at = read_transcript(_Path(results_dir) / (r["sample_id"] + ".transcript.json.gz"))
-        if ct is None or at is None:
-            exposure[attack]["no_transcript"] += 1
-            continue
-        t = first_differing_step(ct, at)
+        # the same pairing rq2_geometry / stats / persistent_homology use,
+        # including image-only payloads (text identical, activations differ)
+        t, st = arrival_or_acts(results_dir, clean["sample_id"], r["sample_id"],
+                                accept_step0=accept_step0)
         if t is None:
-            exposure[attack]["not_exposed"] += 1
-            continue
-        if check_arrival(ct, at, t) is not None:   # divergence is not the payload arriving
-            exposure[attack]["not_payload_arrival"] += 1
+            exposure[attack][{"length_differs_no_diff": "not_exposed"}.get(st, st)] = \
+                exposure[attack].get({"length_differs_no_diff": "not_exposed"}.get(st, st), 0) + 1
             continue
         exposure[attack]["exposed"] += 1
         adv_t = _load_turn(tensor_path(r), t)
         cln_t = _load_turn(tensor_path(clean), t)
         if adv_t is None or cln_t is None:
             continue
-        s = None if r.get("scoring_error_final") else r.get("asr_success")
+        s = normalise_asr(r)
         outcome = "success" if s is True else ("failure" if s is False else "unscored")
         for layer, h_adv in adv_t.items():
             h_cln = cln_t.get(layer)
@@ -512,6 +649,8 @@ def main():
     ap.add_argument("--pca_layer", type=int, default=None,
                     help="default: deepest available layer")
     ap.add_argument("--skip_probe", action="store_true")
+    ap.add_argument("--accept_step0", action="store_true",
+                    help="payload is in the first observation (VWA): accept arrival at step 0")
     ap.add_argument("--include_defended", action="store_true",
                     help="defended rows share attack_name with undefended "
                          "ones and will overwrite them; use rq2_geometry.py "
@@ -532,7 +671,7 @@ def main():
     # RQ1 headline at the payload's arrival turn (per directory, needs transcripts).
     payload_outcome, payload_exposure = {}, {}
     for d in args.results_dir:
-        s, e = displacement_by_outcome_payload(d)
+        s, e = displacement_by_outcome_payload(d, accept_step0=args.accept_step0)
         if s or e:
             payload_outcome[d] = s
             payload_exposure[d] = e

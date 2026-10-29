@@ -184,7 +184,7 @@ def test_G_zero_reach_attack_does_not_kill_the_run(tmp_path, monkeypatch, capsys
     d = _zero_reach_dir(tmp_path)
     out = tmp_path / "out" / "stats.json"
     monkeypatch.setattr(sys, "argv", ["stats.py", "--results_dir", str(d),
-                                      "--layer", str(L), "--n_perm", "5",
+                                      "--layer", str(L), "--n_perm", "5", "--turn", "mean",
                                       "--out", str(out)])
     st.main()                                       # must not raise
     res = json.loads(out.read_text())
@@ -201,7 +201,7 @@ def test_G_json_is_written_before_any_report_printing(tmp_path, monkeypatch):
     d = _zero_reach_dir(tmp_path)
     out = tmp_path / "out" / "stats.json"
     monkeypatch.setattr(sys, "argv", ["stats.py", "--results_dir", str(d),
-                                      "--layer", str(L), "--n_perm", "5",
+                                      "--layer", str(L), "--n_perm", "5", "--turn", "mean",
                                       "--out", str(out)])
 
     def exploding_print(*args, **kw):
@@ -538,3 +538,101 @@ def test_reach_vs_asr_needs_two_tasks_per_reach_class():
     spec = [("workspace", 1, True, 1.0, 6), ("workspace", 8, False, 0.1, 6)]
     e = st.reach_vs_asr({"atk": _task_items(spec, seed=5)}, n_perm=500)[0]
     assert "p_raw" not in e and "p_holm" not in e
+
+
+
+# --- payload-arrival turn ----------------------------------------------------
+import gzip, hashlib  # noqa: E402
+
+
+def _tr(d, sid, msgs, comps):
+    steps = [{"input": list(range(k + 1)),
+              "prompt_sha256": hashlib.sha256(json.dumps(msgs[: k + 1]).encode()).hexdigest(),
+              "completion": c, "tool_calls": [c]} for k, c in enumerate(comps)]
+    (d / f"{sid}.transcript.json.gz").write_bytes(
+        gzip.compress(json.dumps({"messages": msgs, "steps": steps}).encode()))
+
+
+def test_load_pairs_arrival_mode(tmp_path):
+    d = tmp_path / "arr"
+    d.mkdir()
+    S = {"role": "system", "content": [{"type": "text", "text": "s"}]}
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for i in range(4):
+        tid = f"workspace_user_task_{i}_injection_task_0"
+        cm = [S, T("ok"), T("more")]
+        am = [S, T("ok PAYLOAD"), T("more")] if i < 2 else cm      # tasks 2,3 never exposed
+        ac = ["x", "y", "z"] if i != 1 else ["DIFF", "y", "z"]     # task 1: not the payload arriving
+        _row_g(rows, f"c_{tid}", "clean", "clean", tid)
+        _tr(d, f"c_{tid}", cm, ["x", "y", "z"])
+        torch.save([{L: torch.tensor(v)} for v in ([9.0, 9.0], [1.0, 0.0], [9.0, 9.0])], d / f"c_{tid}.pt")
+        _row_g(rows, f"a_{tid}", "attacked", "A", tid, asr=(i == 0))
+        _tr(d, f"a_{tid}", am, ac)
+        av = ([9.0, 9.0], [4.0, 0.0], [-9.0, 9.0]) if i < 2 else ([9.0, 9.0], [1.0, 0.0], [9.0, 9.0])
+        torch.save([{L: torch.tensor(v)} for v in av], d / f"a_{tid}.pt")      # unexposed: identical
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    info = {}
+    pairs = st.load_pairs(str(d), L, turn="arrival", info=info)["A"]
+    assert info["A"] == {"ok": 1, "not_payload_arrival": 1, "not_exposed": 2}
+    by = {t: (hc, ha) for t, _, hc, ha, _ in pairs}
+    assert len(by) == 3
+    hc, ha = by["workspace_user_task_0_injection_task_0"]
+    assert np.allclose(hc, [1.0, 0.0]) and np.allclose(ha, [4.0, 0.0])     # turn 1, not the mean
+    hc, ha = by["workspace_user_task_2_injection_task_0"]
+    assert np.allclose(hc, ha)                                             # unexposed: unreached
+    r = st.reachability({"A": pairs})["A"]
+    assert (r["n"], r["n_nonzero"]) == (3, 1)
+
+
+
+def test_stats_holm_ignores_nonfinite():
+    es = [{"p": 0.01}, {"p": float("nan")}, {"p": 0.04}]
+    st.holm(es, "p", "q")
+    assert "q" not in es[1] and es[0]["q"] == pytest.approx(0.02)
+
+
+def test_load_pairs_image_only_vwa_payload(tmp_path):
+    d = tmp_path / "img"
+    d.mkdir()
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for i in range(4):
+        tid = f"reddit_{i}_wrong_object_cap"
+        _row_g(rows, f"c_{tid}", "clean", "clean", tid)
+        _tr(d, f"c_{tid}", [T("page")], ["act"])
+        torch.save([{L: torch.tensor([0.0, 0.0])}], d / f"c_{tid}.pt")
+        _row_g(rows, f"a_{tid}", "attacked", "img", tid, asr=1 if i == 0 else 0)   # 0/1 scores
+        _tr(d, f"a_{tid}", [T("page")], ["act"])                                    # text identical
+        torch.save([{L: torch.tensor([2.0, 0.0])}], d / f"a_{tid}.pt")
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    info = {}
+    pairs = st.load_pairs(str(d), L, turn="arrival", accept_step0=True, info=info)["img"]
+    assert info["img"] == {"ok_acts": 4}
+    assert st.reachability({"img": pairs})["img"]["n_nonzero"] == 4                # not "unreached"
+    assert all(type(a) is bool for *_, a in pairs)                                  # 0/1 normalised
+    assert sorted(a for *_, a in pairs) == [False, False, False, True]
+    info = {}
+    assert st.load_pairs(str(d), L, turn="arrival", info=info) == {}
+    assert info["img"] == {"prompt_same_acts_differ": 4}
+
+
+def test_stats_empty_writes_json_and_hints(tmp_path, monkeypatch):
+    d = tmp_path / "v"
+    d.mkdir()
+    T = lambda x: {"role": "user", "content": [{"type": "text", "text": "[TOOL RESULT] " + x}]}
+    rows = []
+    for i in range(3):
+        tid = f"reddit_{i}_x"
+        for sid, cond, atk, txt in [(f"c{i}", "clean", "clean", "page"), (f"a{i}", "attacked", "A", "page P")]:
+            _row_g(rows, sid, cond, atk, tid)
+            _tr(d, sid, [T(txt)], ["act"])
+            torch.save([{L: torch.tensor([1.0, float("P" in txt)])}], d / f"{sid}.pt")
+    (d / "attack_results.json").write_text(json.dumps(rows))
+    out = tmp_path / "o" / "s.json"
+    monkeypatch.setattr(sys, "argv", ["stats.py", "--results_dir", str(d), "--layer", str(L),
+                                      "--n_perm", "5", "--out", str(out)])
+    with pytest.raises(SystemExit) as ex:
+        st.main()
+    assert "--accept_step0" in str(ex.value.code)
+    assert json.loads(out.read_text())["arrival"]["A"]["not_payload_arrival"] == 3

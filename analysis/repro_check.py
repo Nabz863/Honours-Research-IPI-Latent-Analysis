@@ -84,9 +84,18 @@ def _read_tr(p: Path):
         return None
 
 
-def _act_diff(a, b) -> Dict[str, Any]:
-    """Largest absolute and relative difference over every turn and layer."""
+def _act_diff(a, b, n_turns: Optional[int] = None) -> Dict[str, Any]:
+    """Largest absolute and relative difference over the first n_turns turns
+    (all if None) and every layer. Callers pass the number of leading steps
+    whose prompts are identical: after the trajectories diverge the inputs
+    differ, and a difference there is not a reproducibility difference.
+    Non-finite values make the episode non-comparable (max() would otherwise
+    swallow a NaN and report it as bitwise equal)."""
     import torch
+    if n_turns is not None:
+        a, b = a[:n_turns], b[:n_turns]
+        if not a or not b:
+            return {"comparable": False, "reason": "no prompt-identical turn"}
     if len(a) != len(b):
         return {"turns": [len(a), len(b)], "comparable": False}
     max_abs = max_rel = 0.0
@@ -98,12 +107,14 @@ def _act_diff(a, b) -> Dict[str, Any]:
             x, y = ta[k].float(), tb[k].float()
             if x.shape != y.shape:
                 return {"shape_differs": [list(x.shape), list(y.shape)], "comparable": False}
+            if not (torch.isfinite(x).all() and torch.isfinite(y).all()):
+                return {"comparable": False, "nonfinite": True}
             d = (x - y).abs().max().item()
             r = ((x - y).norm() / x.norm().clamp_min(1e-12)).item()
             max_abs, max_rel = max(max_abs, d), max(max_rel, r)
             n += 1
-    return {"comparable": True, "tensors": n, "max_abs": max_abs, "max_rel": max_rel,
-            "bitwise": max_abs == 0.0}
+    return {"comparable": True, "turns_compared": len(a), "tensors": n, "max_abs": max_abs,
+            "max_rel": max_rel, "bitwise": max_abs == 0.0}
 
 
 def compare(orig: Path, rep: Path, out: Path, sids: List[str]) -> Dict[str, Any]:
@@ -137,14 +148,22 @@ def compare(orig: Path, rep: Path, out: Path, sids: List[str]) -> Dict[str, Any]
         ta, tb = _read_tr(orig / f"{s}.transcript.json.gz"), _read_tr(rep / f"{s}.transcript.json.gz")
         xa, xb = _turns_text(ta), _turns_text(tb)
         e["prompts_same"] = xa is not None and xb is not None and [p for p, _ in xa] == [p for p, _ in xb]
+        # leading steps whose PROMPTS are identical: activations are comparable there only
+        n_same = None
+        if xa is not None and xb is not None:
+            n_same = next((i for i, (u, v) in enumerate(zip(xa, xb)) if u[0] != v[0]), min(len(xa), len(xb)))
+            e["prompt_identical_turns"] = n_same
         e["completions_same"] = xa is not None and xb is not None and [c for _, c in xa] == [c for _, c in xb]
         if e["prompts_same"] is False and xa and xb:
             e["first_differing_step"] = next((i for i, (u, v) in enumerate(zip(xa, xb)) if u != v), min(len(xa), len(xb)))
-        try:
-            e["activations"] = _act_diff(torch.load(orig / f"{s}.pt", weights_only=False),
-                                         torch.load(rep / f"{s}.pt", weights_only=False))
-        except Exception as ex:  # noqa: BLE001
-            e["activations"] = {"comparable": False, "error": f"{type(ex).__name__}: {ex}"[:200]}
+        if n_same is None:     # no transcript: cannot tell which turns saw the same input
+            e["activations"] = {"comparable": False, "reason": "no transcript"}
+        else:
+            try:
+                e["activations"] = _act_diff(torch.load(orig / f"{s}.pt", weights_only=False),
+                                             torch.load(rep / f"{s}.pt", weights_only=False), n_same)
+            except Exception as ex:  # noqa: BLE001
+                e["activations"] = {"comparable": False, "error": f"{type(ex).__name__}: {ex}"[:200]}
         res.append(e)
 
     done = [r for r in res if "asr_same" in r]
@@ -162,7 +181,10 @@ def compare(orig: Path, rep: Path, out: Path, sids: List[str]) -> Dict[str, Any]
         "activations_max_rel": max((x["max_rel"] for x in acts), default=None),
         "activations_max_abs": max((x["max_abs"] for x in acts), default=None),
     }
-    lines += [f"# Reproducibility: {orig.name} vs {rep.name}", "",
+    gpus = sorted({str((r.get("run_settings_diff") or {}).get("gpu_name")) for r in done
+                   if (r.get("run_settings_diff") or {}).get("gpu_name")})
+    lines += [f"# Reproducibility: {orig.name} vs {rep.name}"
+              + (f" (CROSS-HARDWARE: gpu_name {gpus[0]})" if gpus else ""), "",
               f"Episodes: {len(sids)}; compared {len(done)}",
               f"- ASR identical: {summary['asr_same']}/{len(done)}",
               f"- UA identical: {summary['ua_same']}/{len(done)}",
@@ -176,6 +198,7 @@ def compare(orig: Path, rep: Path, out: Path, sids: List[str]) -> Dict[str, Any]
               f"{summary['run_settings_differ'] or 'none'}"
               + (f" e.g. {summary['run_settings_diff_example']}" if summary['run_settings_differ'] else ""),
               f"- activations bitwise identical: {summary['activations_bitwise']}/{summary['activations_compared']} "
+              f"over prompt-identical turns only "
               f"(largest relative difference {summary['activations_max_rel']}, absolute {summary['activations_max_abs']})",
               ""]
     if summary["not_compared"]:
